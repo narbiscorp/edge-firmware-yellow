@@ -51,9 +51,21 @@ static const char *TAG = "narbis_central";
 
 #define NARBIS_GATTC_APP_ID        0x55  /* arbitrary; distinct from gatts app */
 
-#define SCAN_DIRECTED_S            5
+/* Directed scan window for the persisted earclip MAC. Bumped from
+ * 5 s to 30 s so the glasses are scanning ~86 % of the time after
+ * a wake/disconnect (was ~14 % with 5 s scan + 30 s backoff). The
+ * window where the earclip can wake from sleep / re-enter range
+ * and not be picked up nearly disappears. Bluedroid scanning at
+ * default duty cycle is small change vs the LED + lens drive, so
+ * the battery cost is negligible. */
+#define SCAN_DIRECTED_S            30
 #define SCAN_GENERAL_S             30
-#define RECONNECT_BACKOFF_MS       30000
+/* Backoff between failed directed-scan windows. Was 30 s, which
+ * combined with the 5 s scan meant up to 35 s before the next
+ * chance to catch a freshly-advertising earclip. 5 s gives a
+ * 30 + 5 = 35 s scan/idle ratio of 86/14 — most of the time the
+ * radio is listening. */
+#define RECONNECT_BACKOFF_MS       5000
 
 /* CCCD descriptor UUID (BLE-spec well-known). */
 #define BLE_UUID_CCCD              0x2902
