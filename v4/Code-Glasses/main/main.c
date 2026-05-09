@@ -5858,6 +5858,30 @@ static void on_central_state(bool connected) {
     ble_log("relay %s", connected ? "linked" : "lost");
     if (connected) {
         indicator_trigger(3, 0);      /* 3 slow pulses, no hold       */
+
+        /* Auto-enter PPG-auto / HEARTBEAT on earclip-link, mirroring
+         * the local-sensor plug-in path at line ~2832. The earclip is
+         * functionally equivalent to plugging in the local PulseSensor
+         * — IBI is now flowing — and previously the user had to send
+         * 0xB7 manually from the dashboard to start the training
+         * session. Skip if already in ppg-auto so we don't clobber
+         * an explicitly-chosen program. Once on, PPG-auto stays on
+         * for the rest of the session (matches the existing local-
+         * sensor design — no auto-exit on transient relay drop). */
+        if (!ppg_auto_active) {
+            saved_hall_program = current_program;
+            ppg_auto_active = true;
+            adapt_resp_clear();
+            ble_log("ppg auto: ON via earclip-link (was prog %d)",
+                    (int)saved_hall_program);
+            ESP_LOGI(TAG, "earclip-link → entering PPG-auto (saved prog=%d)",
+                     (int)saved_hall_program);
+            ppg_apply_program(PPG_PROG_HEARTBEAT);
+            session_start_tick = xTaskGetTickCount();
+            if (ble_stack_up && !is_connected) {
+                ble_adv_reset_deadline();
+            }
+        }
     } else {
         indicator_trigger(2, 0);      /* 2 fast pulses */
     }
