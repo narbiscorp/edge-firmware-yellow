@@ -1014,6 +1014,23 @@ void narbis_central_emit_diag(void) {
     }
 }
 
+esp_err_t narbis_central_request_config_read(void) {
+    /* Need an active connection (conn_id != 0) and a discovered CONFIG
+     * handle. Both are populated by the discovery chain in gattc_cb.
+     * State doesn't need to be exactly ST_READY — self-heal can leave
+     * us in a transient state with handles cached but state pre-READY,
+     * and the caller (dashboard via 0xC5) has no way to know which.
+     * The READ_CHAR_EVT handler dispatches the result through config_cb
+     * regardless of state. */
+    if (S.conn_id == 0 || S.hdl_config == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t err = esp_ble_gattc_read_char(
+        S.gattc_if, S.conn_id, S.hdl_config, ESP_GATT_AUTH_REQ_NONE);
+    cb_log("central: config re-read requested rc=%d", err);
+    return err;
+}
+
 esp_err_t narbis_central_write_earclip_config(const uint8_t *bytes, size_t len) {
     if (S.state != ST_READY || S.hdl_config_write == 0) {
         return ESP_ERR_INVALID_STATE;
