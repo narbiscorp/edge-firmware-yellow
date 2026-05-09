@@ -4179,6 +4179,18 @@ static void process_command(uint8_t *data, uint16_t len) {
             break;
         }
 
+        case 0xC5: {  /* Path B Phase 1: dashboard requests a fresh CONFIG
+                       * read from the earclip. Sent when relay goes UP but
+                       * the dashboard hasn't received a 0xF4 frame within
+                       * a couple of seconds — typically because the one-shot
+                       * read inside enter_ready was dropped by Bluedroid's
+                       * outbound queue. Also exposed as a manual "Reload"
+                       * button in the ConfigPanel. arg ignored. */
+            esp_err_t err = narbis_central_request_config_read();
+            ble_log("0xC5 config refresh rc=%d", err);
+            break;
+        }
+
         case 0xD0:  /* v4.12.6: Manual detector reset.
                      * Clears all detection state (MA buffers, block state,
                      * run counter, last-beat time). Preserves

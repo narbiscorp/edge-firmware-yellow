@@ -128,6 +128,17 @@ esp_err_t narbis_central_write_earclip_config(const uint8_t *bytes, size_t len);
  * the discovery / ready logs that fired into the void at boot. */
 void narbis_central_emit_diag(void);
 
+/* On-demand re-issue of the one-shot CONFIG read. enter_ready() does
+ * this once after subscribe, but if Bluedroid's outbound queue was
+ * full (9+ ops fire back-to-back: register_for_notify x4, CCCD writes
+ * x4-5, then this read), the read can be dropped and never reach the
+ * earclip — the dashboard then never gets a 0xF4 frame and the
+ * ConfigPanel stays empty. The dashboard sends 0xC5 on relay-up if
+ * config still null after a short delay; this function is what 0xC5
+ * dispatches to. Returns ESP_ERR_INVALID_STATE if not connected or
+ * if the CONFIG handle was never discovered. */
+esp_err_t narbis_central_request_config_read(void);
+
 #ifdef __cplusplus
 }
 #endif
