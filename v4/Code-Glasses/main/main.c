@@ -2412,6 +2412,14 @@ static volatile uint8_t breathe_wave       = 0;    /* 0=sine, 1=linear */
  * individual u8 fields is sufficient. */
 static narbis_coh_params_t g_coh_params = NARBIS_COH_PARAMS_DEFAULTS_INIT;
 
+/* Current adaptive-pacer cycle BPM (Programs 2 & 4). Written by led_task
+ * when the cycle duration changes (entry, boundary). Read by
+ * coh_emit_packet so the dashboard can show what BPM the pacer actually
+ * adopted vs. the instantaneous resp_peak_mhz (which may differ by a few
+ * BPM until adapt_resp_bpm_avg's 15s ring converges). u8 access is
+ * atomic on ESP32 — no mutex needed. 0 = no breathing program running. */
+static volatile uint8_t coh_pacer_current_bpm = 0;
+
 /*******************************************************************************
  * PERSISTENT PREFERENCES LOADER (v4.14.35)
  *
@@ -3387,6 +3395,7 @@ static void led_task(void *param) {
                  * and start this cycle fresh at now. */
                 cb_cycle_ms = 60000 / ADAPT_BPM_START;
                 cb_cycle_start_tick = now_tick;
+                coh_pacer_current_bpm = ADAPT_BPM_START;
             }
             cb_prev_mode = led_mode;
 
@@ -3400,12 +3409,16 @@ static void led_task(void *param) {
                     uint8_t measured_bpm = adapt_resp_bpm_avg();
                     if (measured_bpm > 0) {
                         cb_cycle_ms = 60000 / measured_bpm;
+                        coh_pacer_current_bpm = measured_bpm;
                     }
                     /* If measured_bpm is 0 (ring empty), keep previous
-                     * cycle — don't reset to BPM_START mid-session. */
+                     * cycle — don't reset to BPM_START mid-session.
+                     * coh_pacer_current_bpm also stays so the dashboard
+                     * keeps showing the last adopted value. */
                 } else {
                     /* Disabled: force back to 6 BPM each cycle. Idempotent. */
                     cb_cycle_ms = 60000 / ADAPT_BPM_START;
+                    coh_pacer_current_bpm = ADAPT_BPM_START;
                 }
                 cb_cycle_start_tick = now_tick;
                 elapsed_ms = 0;
@@ -5663,6 +5676,12 @@ static void coh_compute(void) {
 /* Emit coherence packet on 0xFF03 status characteristic.
  * 0xF2 type, 18 bytes total. Dashboard v13.10+ parses.
  *
+ * v4.14.40: byte 17 repurposed from `reserved 0` → current adaptive-pacer
+ * cycle BPM (Programs 2 & 4). Older dashboards that ignored byte 17 are
+ * unaffected; newer dashboards (the one updated alongside this change)
+ * display "Pacer: N BPM" alongside "Resp: N.NN BPM" so the user can see
+ * whether the pacer has converged to the detected breathing rate.
+ *
  * [0]   type = 0xF2
  * [1]   coherence 0-100
  * [2-3] resp peak freq in mHz (LF resonance peak)
@@ -5697,7 +5716,7 @@ static void coh_emit_packet(void) {
     pkt[14] = (uint8_t)(coh_state.lf_hf_fp88 & 0xFF);
     pkt[15] = (uint8_t)((coh_state.lf_hf_fp88 >> 8) & 0xFF);
     pkt[16] = coh_state.n_ibis_used;
-    pkt[17] = 0;
+    pkt[17] = coh_pacer_current_bpm;  /* v4.14.40: current pacer cycle BPM */
     esp_err_t err = esp_ble_gatts_send_indicate(gatts_if_global, conn_id_global,
                                                 status_char_handle, sizeof(pkt), pkt, false);
     if (err != ESP_OK) ble_send_errors++;
