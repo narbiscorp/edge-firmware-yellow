@@ -157,6 +157,16 @@ typedef enum {
     NARBIS_DATA_IBI_PLUS_RAW = 2
 } narbis_data_format_t;
 
+/* Detector mode (config_version 4). FIXED keeps the proven Elgendi rule-based
+ * detector unchanged. ADAPTIVE wraps it with online template matching (NCC),
+ * a 1-D Kalman filter on IBI, self-tuning alpha, and a state watchdog. The
+ * adaptive path adds template_window_ms/2 of look-ahead — at the default
+ * 200 Hz sample rate that's 100 ms, well inside the <300 ms target. */
+typedef enum {
+    NARBIS_DETECTOR_FIXED    = 0,
+    NARBIS_DETECTOR_ADAPTIVE = 1
+} narbis_detector_mode_t;
+
 /* Beat-event flag bitmask (union of zero or more bits). */
 #define NARBIS_BEAT_FLAG_ARTIFACT       0x01u
 #define NARBIS_BEAT_FLAG_LOW_SQI        0x02u
@@ -357,7 +367,12 @@ typedef struct __attribute__((packed)) {
      *   2 — diagnostics_mask repurposed from reserved_pwr.
      *   3 — Path B: removed transport_mode / partner_mac / espnow_channel
      *       (ESP-NOW deleted). Older blobs harmlessly fall back to defaults
-     *       on load via the version>=3 check in config_manager_init. */
+     *       on load via the version>=3 check in config_manager_init.
+     *   4 — Path C: added detector_mode + adaptive-detector params
+     *       (NCC template, Kalman, watchdog) and Layer-E auxiliary
+     *       knobs (agc_adaptive_step, refractory_ibi_pct). Older blobs
+     *       are rejected and defaults are loaded; the new fields zero
+     *       to FIXED-mode behavior so a partial blob would still be safe. */
     uint16_t config_version;
 
     /* ---- sensor ---- */
@@ -400,7 +415,85 @@ typedef struct __attribute__((packed)) {
     uint8_t  diagnostics_mask;      /* NARBIS_DIAG_STREAM_* bitmask; 0 = none. Repurposed
                                      * from reserved_pwr in config_version 2. */
     uint16_t battery_low_mv;        /* below this, signal low-battery (default 3300) */
+
+    /* ---- adaptive detector (config_version 4) ----
+     * Set detector_mode=NARBIS_DETECTOR_FIXED to revert to the proven rule-based
+     * Elgendi pipeline. All other fields below are ignored when FIXED. */
+    uint8_t  detector_mode;              /* narbis_detector_mode_t (default FIXED) */
+    uint8_t  template_max_beats;         /* rolling template depth (default 10) */
+    uint8_t  template_warmup_beats;      /* beats before NCC gate activates (default 4) */
+    uint8_t  kalman_warmup_beats;        /* beats before Kalman gate activates (default 5) */
+    uint16_t template_window_ms;         /* matched-filter window length, ms (default 200) */
+    uint16_t ncc_min_x1000;              /* admit threshold, NCC ×1000 (default 500 = 0.500) */
+    uint16_t ncc_learn_min_x1000;        /* template-learning threshold (default 750 = 0.750) */
+    uint16_t kalman_q_ms2;               /* process noise variance, ms² (default 400) */
+    uint16_t kalman_r_ms2;               /* measurement noise baseline, ms² (default 2500) */
+    uint8_t  kalman_sigma_x10;           /* IBI gate width, σ ×10 (default 30 = 3.0σ) */
+    uint8_t  watchdog_max_consec_rejects;/* full-reset trigger (default 5) */
+    uint16_t watchdog_silence_ms;        /* full-reset silence trigger, ms (default 4000) */
+    uint16_t alpha_min_x1000;            /* α floor ×1000 (default 10 = 0.010) */
+    uint16_t alpha_max_x1000;            /* α ceiling ×1000 (default 500 = 0.500) */
+
+    /* ---- adaptive auxiliary (Layer E, Tier 1) ---- */
+    uint8_t  elgendi_loose_mode;         /* 0/1 — relax Elgendi β and NCC admit by 50% for
+                                          * motion tolerance. Repurposed from former
+                                          * agc_adaptive_step (same wire byte, same range). */
+    uint8_t  refractory_ibi_pct;         /* refractory = ibi_min_ms .. (pct/100)·IBI (default 60) */
 } narbis_runtime_config_t;
+
+/* =============================================================
+ * Edge glasses coherence-pipeline tuning struct.
+ *
+ * Lives on the Edge glasses (not the earclip). Written via CTRL opcode
+ * 0xE0 on the glasses' 0xFF01 characteristic; the dashboard exposes the
+ * fields as sliders. Lets the user re-tune the LF peak window, band
+ * boundaries, IBI gating, and coherence scaling at runtime without a
+ * reflash — keeps Approach A's "one source of truth" guarantee while
+ * removing the "coordinated firmware+dashboard updates" cost when
+ * iterating on the algorithm.
+ *
+ * Bin units are FFT-bin indices at the firmware's fixed 4 Hz × 256-point
+ * grid (df = 0.015625 Hz/bin). Compile-time grid is NOT runtime-tunable;
+ * resizing the static FFT buffers would mean dynamic allocation.
+ *
+ * NOTE: the on-glasses NVS storage is one u8 per field (see prefs_load
+ * in EDGE firmware main.c) for simplicity; the wire format below is the
+ * struct as-is.
+ * ============================================================= */
+typedef struct __attribute__((packed)) {
+    uint8_t  min_ibis;             /* default 20; minimum beats to compute coherence */
+    uint8_t  conf_threshold;       /* default 50; drop IBIs with conf<this in on_earclip_ibi / 0xCA */
+    /* Band-integration bin ranges (inclusive) */
+    uint8_t  vlf_band_lo;          /* default 1  */
+    uint8_t  vlf_band_hi;          /* default 2  */
+    uint8_t  lf_band_lo;           /* default 3  */
+    uint8_t  lf_band_hi;           /* default 9  */
+    uint8_t  hf_band_lo;           /* default 10 */
+    uint8_t  hf_band_hi;           /* default 25 */
+    /* LF-peak search (Lehrer/Vaschillo numerator) */
+    uint8_t  lf_peak_lo;           /* default 3  */
+    uint8_t  lf_peak_hi;           /* default 9  */
+    uint8_t  peak_halfwidth;       /* default 0 → single-bin peak; N → ±N bins inclusive */
+    /* Score scaling */
+    uint8_t  coh_multiplier;       /* default 100 (was 250 pre-v4.14.31) */
+} narbis_coh_params_t;
+
+#define NARBIS_COH_PARAMS_WIRE_SIZE 12u  /* matches sizeof(narbis_coh_params_t) */
+
+#define NARBIS_COH_PARAMS_DEFAULTS_INIT { \
+    .min_ibis        = 20,  \
+    .conf_threshold  = 50,  \
+    .vlf_band_lo     = 1,   \
+    .vlf_band_hi     = 2,   \
+    .lf_band_lo      = 3,   \
+    .lf_band_hi      = 9,   \
+    .hf_band_lo      = 10,  \
+    .hf_band_hi      = 25,  \
+    .lf_peak_lo      = 3,   \
+    .lf_peak_hi      = 9,   \
+    .peak_halfwidth  = 0,   \
+    .coh_multiplier  = 100, \
+}
 
 /* Diagnostics stream IDs — bit positions in narbis_runtime_config_t.diagnostics_mask.
  * Each stream is independently subscribable; emission also requires the
@@ -411,6 +504,7 @@ typedef struct __attribute__((packed)) {
 #define NARBIS_DIAG_STREAM_PEAK_CAND    (1u << 2)  /* Elgendi peak candidates pre-validator */
 #define NARBIS_DIAG_STREAM_AGC_EVENT    (1u << 3)  /* per-AGC-step LED current changes */
 #define NARBIS_DIAG_STREAM_FIFO_OCCUP   (1u << 4)  /* MAX3010x FIFO occupancy at each drain */
+#define NARBIS_DIAG_STREAM_DETECTOR_STATS (1u << 5) /* adaptive detector snapshot per beat */
 
 /* =============================================================
  * Helper API (impl in narbis_protocol.c)

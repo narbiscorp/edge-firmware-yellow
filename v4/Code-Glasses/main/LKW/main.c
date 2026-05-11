@@ -2279,21 +2279,6 @@ static uint8_t adapt_resp_bpm_avg(void) {
 #define KEY_COH_DIFFICULTY     "coh_diff"
 #define KEY_COH_ADAPTIVE       "coh_adapt"   /* v4.14.32 */
 
-/* Coherence-pipeline tuning (live-settable via 0xE0 COH_PARAMS).
- * One u8 per field for simplicity; matches the existing prefs_get_u8 path. */
-#define KEY_COH_MINIBIS        "coh_minibi"
-#define KEY_COH_CONFTH         "coh_confth"
-#define KEY_COH_VLF_LO         "coh_vlf_lo"
-#define KEY_COH_VLF_HI         "coh_vlf_hi"
-#define KEY_COH_LF_LO          "coh_lf_lo"
-#define KEY_COH_LF_HI          "coh_lf_hi"
-#define KEY_COH_HF_LO          "coh_hf_lo"
-#define KEY_COH_HF_HI          "coh_hf_hi"
-#define KEY_COH_PK_LO          "coh_pk_lo"
-#define KEY_COH_PK_HI          "coh_pk_hi"
-#define KEY_COH_PK_HW          "coh_pk_hw"
-#define KEY_COH_MULT           "coh_mult"
-
 /* Read a u8 preference. Returns the stored value if present, or
  * `default_val` if the key does not exist or read fails. */
 static uint8_t prefs_get_u8(const char *key, uint8_t default_val) {
@@ -2397,13 +2382,6 @@ static volatile uint8_t breathe_hold_top   = 0;    /* 0-50, units of 100ms */
 static volatile uint8_t breathe_hold_bot   = 0;    /* 0-50, units of 100ms */
 static volatile uint8_t breathe_wave       = 0;    /* 0=sine, 1=linear */
 
-/* Coherence-pipeline tuning struct. Read by coh_compute (bottom of file)
- * and the on_earclip_ibi / 0xCA injectIbi confidence gate; written by the
- * 0xE0 CTRL opcode. Loaded from NVS at boot via prefs_load. Single writer
- * (process_command), single reader per field per task tick — atomicity of
- * individual u8 fields is sufficient. */
-static narbis_coh_params_t g_coh_params = NARBIS_COH_PARAMS_DEFAULTS_INIT;
-
 /*******************************************************************************
  * PERSISTENT PREFERENCES LOADER (v4.14.35)
  *
@@ -2426,34 +2404,10 @@ static void prefs_load(void) {
     breathe_wave        = prefs_get_u8 (KEY_BREATHE_WAVE,     0);
     coh_difficulty      = prefs_get_u8 (KEY_COH_DIFFICULTY,   0);
     coh_pacer_adaptive  = prefs_get_u8 (KEY_COH_ADAPTIVE,     1);  /* v4.14.32: default ON */
-
-    /* Coherence-pipeline tuning — loaded into g_coh_params. Defaults
-     * mirror NARBIS_COH_PARAMS_DEFAULTS_INIT so a fresh NVS or a missing
-     * key both land on the same algorithm shape that's compiled in. */
-    g_coh_params.min_ibis       = prefs_get_u8(KEY_COH_MINIBIS, 20);
-    g_coh_params.conf_threshold = prefs_get_u8(KEY_COH_CONFTH,  50);
-    g_coh_params.vlf_band_lo    = prefs_get_u8(KEY_COH_VLF_LO,  1);
-    g_coh_params.vlf_band_hi    = prefs_get_u8(KEY_COH_VLF_HI,  2);
-    g_coh_params.lf_band_lo     = prefs_get_u8(KEY_COH_LF_LO,   3);
-    g_coh_params.lf_band_hi     = prefs_get_u8(KEY_COH_LF_HI,   9);
-    g_coh_params.hf_band_lo     = prefs_get_u8(KEY_COH_HF_LO,   10);
-    g_coh_params.hf_band_hi     = prefs_get_u8(KEY_COH_HF_HI,   25);
-    g_coh_params.lf_peak_lo     = prefs_get_u8(KEY_COH_PK_LO,   3);
-    g_coh_params.lf_peak_hi     = prefs_get_u8(KEY_COH_PK_HI,   9);
-    g_coh_params.peak_halfwidth = prefs_get_u8(KEY_COH_PK_HW,   0);
-    g_coh_params.coh_multiplier = prefs_get_u8(KEY_COH_MULT,    100);
-
     ESP_LOGI(TAG, "prefs: brt=%d sess=%lumin strb=%dHz/%d%% brth=%dBPM/%d%% coh_diff=%d adapt=%d",
              brightness, (unsigned long)(session_duration_ms/60000),
              strobe_dhz/10, strobe_duty_pct,
              breathe_bpm, breathe_inhale_pct, coh_difficulty, coh_pacer_adaptive);
-    ESP_LOGI(TAG, "coh_params: minibi=%u confth=%u vlf=[%u..%u] lf=[%u..%u] hf=[%u..%u] pk=[%u..%u]±%u mult=%u",
-             g_coh_params.min_ibis, g_coh_params.conf_threshold,
-             g_coh_params.vlf_band_lo, g_coh_params.vlf_band_hi,
-             g_coh_params.lf_band_lo,  g_coh_params.lf_band_hi,
-             g_coh_params.hf_band_lo,  g_coh_params.hf_band_hi,
-             g_coh_params.lf_peak_lo,  g_coh_params.lf_peak_hi,
-             g_coh_params.peak_halfwidth, g_coh_params.coh_multiplier);
 }
 
 /* AC drive state - shared between tasks */
@@ -3068,11 +3022,9 @@ static void ble_log(const char *fmt, ...) {
 
 /* Path B Phase 1/2: emit a binary status frame on 0xFF03.
  * Layout: [type u8][payload …]. Used for 0xF4 (relayed earclip config,
- * NARBIS_CONFIG_WIRE_SIZE bytes), 0xF5 (relayed raw PPG batch, up to
- * 4 + 29*8 = 236 bytes), 0xF7 (relayed earclip diagnostics), and
- * 0xF8 (relayed earclip battery: 4 B = mv u16 LE, soc u8, charging u8).
- * The negotiated MTU on Web Bluetooth is typically 247, so 240 B
- * payload + 1 B type fits. */
+ * NARBIS_CONFIG_WIRE_SIZE bytes) and 0xF5 (relayed raw PPG batch, up to
+ * 4 + 29*8 = 236 bytes). The negotiated MTU on Web Bluetooth is typically
+ * 247, so 240 B payload + 1 B type fits. */
 static void send_status_frame(uint8_t type, const uint8_t *payload, size_t len) {
     if (!notifications_enabled || !is_connected) return;
     if (status_char_handle == 0) return;
@@ -4227,102 +4179,15 @@ static void process_command(uint8_t *data, uint16_t len) {
             break;
         }
 
-        case 0xCA: {  /* External-IBI injection (dashboard / Polar H10 path).
-                       * Lets the dashboard drive the same coherence pipeline
-                       * the earclip would, when the user picks H10 as the
-                       * HR source. Mirrors on_earclip_ibi (see main.c near
-                       * the bottom of this file) exactly so all four PPG
-                       * programs respond identically regardless of source.
-                       *
-                       * Wire format (5 B total including opcode):
-                       *   [0]    = 0xCA
-                       *   [1..2] = ibi_ms u16 LE
-                       *   [3]    = confidence 0..100 (drop if < 50)
-                       *   [4]    = flags (NARBIS_BEAT_FLAG_*, drop ARTIFACT)
-                       */
-            if (len < 5) {
-                ble_log("0xCA short len=%u (need 5)", len);
-                break;
-            }
-            uint16_t ibi_ms = (uint16_t)data[1] | ((uint16_t)data[2] << 8);
-            uint8_t  conf   = data[3];
-            uint8_t  flags  = data[4];
-            if (conf < g_coh_params.conf_threshold || (flags & NARBIS_BEAT_FLAG_ARTIFACT)) break;
-            beat_pulse_start_tick = xTaskGetTickCount();  /* Program 1 flash */
-            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-            if (ibi_ms > 0) coh_push_ibi(now_ms, ibi_ms);
-            break;
-        }
-
-        case 0xE0: {  /* Coherence-pipeline tuning (live update of g_coh_params).
-                       * Lets the dashboard tweak LF peak window, band ranges,
-                       * confidence gate, and score multiplier without a reflash.
-                       *
-                       * Wire format: opcode + packed narbis_coh_params_t
-                       *   [0]    = 0xE0
-                       *   [1..12]= narbis_coh_params_t (12 B, see protocol/narbis_protocol.h)
-                       * Total 13 B. Validation rejects out-of-grid bins and
-                       * inverted lo/hi pairs so a buggy dashboard write can't
-                       * lock the algorithm in a non-recoverable state.
-                       *
-                       * On success, the new params apply on the next coherence
-                       * compute (≤1 s) and persist to NVS. */
-            const uint16_t need = 1 + NARBIS_COH_PARAMS_WIRE_SIZE;
-            if (len < need) {
-                ble_log("0xE0 short len=%u (need %u)", len, need);
-                break;
-            }
-            narbis_coh_params_t p;
-            p.min_ibis       = data[1];
-            p.conf_threshold = data[2];
-            p.vlf_band_lo    = data[3];
-            p.vlf_band_hi    = data[4];
-            p.lf_band_lo     = data[5];
-            p.lf_band_hi     = data[6];
-            p.hf_band_lo     = data[7];
-            p.hf_band_hi     = data[8];
-            p.lf_peak_lo     = data[9];
-            p.lf_peak_hi     = data[10];
-            p.peak_halfwidth = data[11];
-            p.coh_multiplier = data[12];
-
-            /* Bounds + sanity checks. Bins are at df = 4/256 Hz; bin 127
-             * is the Nyquist edge (COH_GRID_N/2 - 1; the macro is defined
-             * lower in the file). Reject inverted ranges and out-of-grid. */
-            const uint8_t NYQUIST_BIN = 127;
-            if (p.min_ibis < 5 || p.min_ibis > 120 ||
-                p.conf_threshold > 100 ||
-                p.vlf_band_lo > p.vlf_band_hi || p.vlf_band_hi > NYQUIST_BIN ||
-                p.lf_band_lo  > p.lf_band_hi  || p.lf_band_hi  > NYQUIST_BIN ||
-                p.hf_band_lo  > p.hf_band_hi  || p.hf_band_hi  > NYQUIST_BIN ||
-                p.lf_peak_lo  > p.lf_peak_hi  || p.lf_peak_hi  > NYQUIST_BIN ||
-                p.peak_halfwidth > 8 ||
-                p.coh_multiplier < 10) {
-                ble_log("0xE0 reject: out-of-range");
-                break;
-            }
-
-            /* Apply atomically (field-by-field write; the struct only holds
-             * u8 fields so each is atomic against the coherence task read). */
-            g_coh_params = p;
-
-            /* Persist each field. 12 NVS writes — small one-shot cost. */
-            prefs_set_u8(KEY_COH_MINIBIS, p.min_ibis);
-            prefs_set_u8(KEY_COH_CONFTH,  p.conf_threshold);
-            prefs_set_u8(KEY_COH_VLF_LO,  p.vlf_band_lo);
-            prefs_set_u8(KEY_COH_VLF_HI,  p.vlf_band_hi);
-            prefs_set_u8(KEY_COH_LF_LO,   p.lf_band_lo);
-            prefs_set_u8(KEY_COH_LF_HI,   p.lf_band_hi);
-            prefs_set_u8(KEY_COH_HF_LO,   p.hf_band_lo);
-            prefs_set_u8(KEY_COH_HF_HI,   p.hf_band_hi);
-            prefs_set_u8(KEY_COH_PK_LO,   p.lf_peak_lo);
-            prefs_set_u8(KEY_COH_PK_HI,   p.lf_peak_hi);
-            prefs_set_u8(KEY_COH_PK_HW,   p.peak_halfwidth);
-            prefs_set_u8(KEY_COH_MULT,    p.coh_multiplier);
-
-            ble_log("0xE0 ok: lf=[%u..%u] hf=[%u..%u] pk=[%u..%u]±%u mult=%u",
-                    p.lf_band_lo, p.lf_band_hi, p.hf_band_lo, p.hf_band_hi,
-                    p.lf_peak_lo, p.lf_peak_hi, p.peak_halfwidth, p.coh_multiplier);
+        case 0xC5: {  /* Path B Phase 1: dashboard requests a fresh CONFIG
+                       * read from the earclip. Sent when relay goes UP but
+                       * the dashboard hasn't received a 0xF4 frame within
+                       * a couple of seconds — typically because the one-shot
+                       * read inside enter_ready was dropped by Bluedroid's
+                       * outbound queue. Also exposed as a manual "Reload"
+                       * button in the ConfigPanel. arg ignored. */
+            esp_err_t err = narbis_central_request_config_read();
+            ble_log("0xC5 config refresh rc=%d", err);
             break;
         }
 
@@ -5481,21 +5346,7 @@ static void coh_compute(void) {
     }
     portEXIT_CRITICAL(&coh_mux);
 
-    /* Snapshot runtime-tunable knobs once at the top so a concurrent
-     * 0xE0 write doesn't change band boundaries mid-compute. */
-    const uint8_t coh_min_ibis    = g_coh_params.min_ibis;
-    const uint8_t coh_vlf_lo      = g_coh_params.vlf_band_lo;
-    const uint8_t coh_vlf_hi      = g_coh_params.vlf_band_hi;
-    const uint8_t coh_lf_lo       = g_coh_params.lf_band_lo;
-    const uint8_t coh_lf_hi       = g_coh_params.lf_band_hi;
-    const uint8_t coh_hf_lo       = g_coh_params.hf_band_lo;
-    const uint8_t coh_hf_hi       = g_coh_params.hf_band_hi;
-    const uint8_t coh_pk_lo       = g_coh_params.lf_peak_lo;
-    const uint8_t coh_pk_hi       = g_coh_params.lf_peak_hi;
-    const uint8_t coh_pk_hw       = g_coh_params.peak_halfwidth;
-    const uint8_t coh_mult        = g_coh_params.coh_multiplier;
-
-    if (snap_count < coh_min_ibis) return;
+    if (snap_count < COH_MIN_IBIS) return;
 
     /* Restrict to last COH_WINDOW_S seconds — the FFT grid covers only
      * this duration. Older beats would wrap the grid or be unused. */
@@ -5508,7 +5359,7 @@ static void coh_compute(void) {
         first_in_window++;
     }
     int n_used = snap_count - first_in_window;
-    if (n_used < coh_min_ibis) return;
+    if (n_used < COH_MIN_IBIS) return;
 
     /* Interpolate onto uniform grid */
     coh_resample(&snap_beat_ms[first_in_window], &snap_ibi_ms[first_in_window],
@@ -5551,9 +5402,9 @@ static void coh_compute(void) {
      * Nyquist at 2 Hz), which is 2-3× larger and systematically drove
      * coherence down. Now matches client. */
     float vlf = 0.0f, lf = 0.0f, hf = 0.0f;
-    for (int i = coh_vlf_lo; i <= coh_vlf_hi; i++) vlf += psd[i];  /* skip DC bin 0 by default (vlf_lo=1) */
-    for (int i = coh_lf_lo;  i <= coh_lf_hi;  i++) lf  += psd[i];
-    for (int i = coh_hf_lo;  i <= coh_hf_hi;  i++) hf  += psd[i];
+    for (int i = 1; i <= 2; i++)  vlf += psd[i];  /* skip DC bin 0 */
+    for (int i = 3; i <= 9; i++)   lf += psd[i];
+    for (int i = 10; i <= 25; i++) hf += psd[i];
     float total = vlf + lf + hf;
 
     /* LF resonance peak (Lehrer/Vaschillo method, matches client v13.10):
@@ -5573,31 +5424,14 @@ static void coh_compute(void) {
      * matching HeartMath's 0.032-0.26Hz range (close enough). Raw score
      * is no longer deflated — it stays comparable across all difficulty
      * levels. Difficulty now only affects the COHERENCE_LENS opacity
-     * mapping curve (see led_task) and the dashboard zone thresholds.
-     *
-     * Range and ±halfwidth are runtime-tunable via 0xE0. halfwidth=0
-     * matches the historical single-bin-peak behavior (firmware v4.13.7
-     * fix). halfwidth>0 sums psd[peak_bin-hw..peak_bin+hw] as the
-     * numerator, which approximates the HeartMath "spectral peak +
-     * neighbors" notion when the resonance is broad. */
-    int peak_bin = coh_pk_lo;
-    float peak_argmax_pow = psd[coh_pk_lo];
-    for (int i = (int)coh_pk_lo + 1; i <= (int)coh_pk_hi; i++) {
-        if (psd[i] > peak_argmax_pow) {
-            peak_argmax_pow = psd[i];
+     * mapping curve (see led_task) and the dashboard zone thresholds. */
+    int peak_bin = 3;
+    float peak_pow = psd[3];
+    for (int i = 4; i <= 9; i++) {
+        if (psd[i] > peak_pow) {
+            peak_pow = psd[i];
             peak_bin = i;
         }
-    }
-    float peak_pow;
-    if (coh_pk_hw == 0) {
-        peak_pow = peak_argmax_pow;
-    } else {
-        int lo_b = peak_bin - (int)coh_pk_hw;
-        int hi_b = peak_bin + (int)coh_pk_hw;
-        if (lo_b < 0) lo_b = 0;
-        if (hi_b > (COH_GRID_N / 2 - 1)) hi_b = COH_GRID_N / 2 - 1;
-        peak_pow = 0.0f;
-        for (int i = lo_b; i <= hi_b; i++) peak_pow += psd[i];
     }
 
     float coherence = 0.0f;
@@ -5610,13 +5444,8 @@ static void coh_compute(void) {
          * breathers, and perfect breathers all saw "100." Now the
          * multiplier produces a 0-100 score that tracks the raw ratio
          * directly, and saturating at 100 requires a ratio of 1.0
-         * (all power in one peak, physically near-impossible).
-         *
-         * Multiplier is runtime-tunable via 0xE0. Bump it back to 250
-         * (or anywhere in between) for an "easier" score that saturates
-         * sooner, useful when a beginner wants visible progress on the
-         * lens. */
-        coherence = ratio * (float)coh_mult;
+         * (all power in one peak, physically near-impossible). */
+        coherence = ratio * 100.0f;
         if (coherence > 100.0f) coherence = 100.0f;
         if (coherence < 0.0f) coherence = 0.0f;
     }
@@ -5985,8 +5814,8 @@ static void on_earclip_ibi(uint16_t ibi_ms, uint8_t conf, uint8_t flags) {
      *   1. LED_MODE_PULSE_ON_BEAT — flash lens once per beat
      *   2. coh_state IBI ring — drives the coherence/breathing pacer
      * Skip low-confidence / artifact-flagged beats so noise doesn't
-     * corrupt either path. Threshold is runtime-tunable via 0xE0. */
-    if (conf < g_coh_params.conf_threshold || (flags & NARBIS_BEAT_FLAG_ARTIFACT)) return;
+     * corrupt either path. */
+    if (conf < 50 || (flags & NARBIS_BEAT_FLAG_ARTIFACT)) return;
     beat_pulse_start_tick = xTaskGetTickCount();
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     if (ibi_ms > 0) {
@@ -5996,16 +5825,6 @@ static void on_earclip_ibi(uint16_t ibi_ms, uint8_t conf, uint8_t flags) {
 
 static void on_earclip_battery(uint8_t soc_pct, uint16_t mv, uint8_t charging) {
     ble_log("earclip batt soc=%u%% mv=%u chg=%u", soc_pct, mv, charging);
-
-    /* Structured pass-through: 4-byte payload mirroring the earclip's
-     * narbis_battery_payload_t (mv u16 LE, soc u8, charging u8). The
-     * dashboard prefers this over the regex-parsed 0xF1 log line. */
-    uint8_t payload[4];
-    payload[0] = (uint8_t)(mv & 0xFF);
-    payload[1] = (uint8_t)((mv >> 8) & 0xFF);
-    payload[2] = soc_pct;
-    payload[3] = charging;
-    send_status_frame(0xF8, payload, sizeof(payload));
 }
 
 /* Path B Phase 1: forward the earclip's CONFIG payload to the dashboard
@@ -6039,17 +5858,42 @@ static void on_earclip_diag(const uint8_t *bytes, uint16_t len) {
  *   2. ble_log line so the BLE event log shows the transition.
  *   3. Visible lens feedback so the user knows without looking at the
  *      app. The disambiguation mnemonic for users:
- *        5 slow pulses + 3 s hold = finger detected on Edge's local PPG
+ *        5 slow pulses + 3 s hold = finger detected on Edge local PPG
  *        3 slow pulses (no hold)  = earclip linked (this path)
  *        2 fast pulses            = earclip lost
- *      Earclip-connect deliberately uses a distinct count from the local
- *      sensor handshake so the user can tell them apart at a glance. */
+ *      Earclip-connect deliberately uses a count distinct from the
+ *      local-sensor 5-pulse handshake so the user can tell them apart
+ *      at a glance. */
 static void on_central_state(bool connected) {
     uint8_t pkt = connected ? 1u : 0u;
     send_status_frame(0xF6, &pkt, 1);
     ble_log("relay %s", connected ? "linked" : "lost");
     if (connected) {
-        indicator_trigger(3, 0);      /* 3 slow pulses, no hold */
+        indicator_trigger(3, 0);      /* 3 slow pulses, no hold       */
+
+        /* Auto-enter PPG-auto / HEARTBEAT on earclip-link, mirroring
+         * the local-sensor plug-in path at line ~2832. The earclip is
+         * functionally equivalent to plugging in the local PulseSensor
+         * — IBI is now flowing — and previously the user had to send
+         * 0xB7 manually from the dashboard to start the training
+         * session. Skip if already in ppg-auto so we don't clobber
+         * an explicitly-chosen program. Once on, PPG-auto stays on
+         * for the rest of the session (matches the existing local-
+         * sensor design — no auto-exit on transient relay drop). */
+        if (!ppg_auto_active) {
+            saved_hall_program = current_program;
+            ppg_auto_active = true;
+            adapt_resp_clear();
+            ble_log("ppg auto: ON via earclip-link (was prog %d)",
+                    (int)saved_hall_program);
+            ESP_LOGI(TAG, "earclip-link → entering PPG-auto (saved prog=%d)",
+                     (int)saved_hall_program);
+            ppg_apply_program(PPG_PROG_HEARTBEAT);
+            session_start_tick = xTaskGetTickCount();
+            if (ble_stack_up && !is_connected) {
+                ble_adv_reset_deadline();
+            }
+        }
     } else {
         indicator_trigger(2, 0);      /* 2 fast pulses */
     }
