@@ -2362,6 +2362,14 @@ static void ppg_reset_detector(void);
  * trips. */
 static void coh_clear(void);
 
+/* Forward declaration for coh_push_ibi — defined with the coherence
+ * module at file-bottom, but called from on_earclip_ibi (also further
+ * down — fine, same scope) AND from the 0xCA INJECT_IBI handler inside
+ * process_command, which appears earlier in the file. Without this
+ * forward decl, GCC implicitly declares it as int(...) and then errors
+ * on the static-vs-non-static linkage mismatch at the real definition. */
+static void coh_push_ibi(uint32_t beat_ms, uint16_t ibi_ms);
+
 /* v4.14.0 forward declaration. coh_state lives with the coherence module
  * at the bottom of the file, but led_task (defined earlier) needs to read
  * the latest coherence score to modulate the coherence-breathing duty.
