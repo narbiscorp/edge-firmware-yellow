@@ -42,6 +42,13 @@ esp_err_t narbis_central_init(narbis_central_ibi_cb_t     ibi_cb,
 
 esp_err_t narbis_central_start(void);
 
+/* Pause the central — closes any active connection, stops scans, halts
+ * the backoff timer, and gates the disconnect-event auto-restart. NVS
+ * pairing is preserved; narbis_central_start() resumes directed scan to
+ * the same earclip. Used when the dashboard sets HR source = H10 so the
+ * glasses stop hunting for the earclip (saves power + radio time). */
+esp_err_t narbis_central_stop(void);
+
 esp_err_t narbis_central_forget(void);
 
 bool      narbis_central_is_connected(void);
@@ -127,17 +134,6 @@ esp_err_t narbis_central_write_earclip_config(const uint8_t *bytes, size_t len);
  * already reached READY — without this, the dashboard would never see
  * the discovery / ready logs that fired into the void at boot. */
 void narbis_central_emit_diag(void);
-
-/* On-demand re-issue of the one-shot CONFIG read. enter_ready() does
- * this once after subscribe, but if Bluedroid's outbound queue was
- * full (9+ ops fire back-to-back: register_for_notify x4, CCCD writes
- * x4-5, then this read), the read can be dropped and never reach the
- * earclip — the dashboard then never gets a 0xF4 frame and the
- * ConfigPanel stays empty. The dashboard sends 0xC5 on relay-up if
- * config still null after a short delay; this function is what 0xC5
- * dispatches to. Returns ESP_ERR_INVALID_STATE if not connected or
- * if the CONFIG handle was never discovered. */
-esp_err_t narbis_central_request_config_read(void);
 
 #ifdef __cplusplus
 }

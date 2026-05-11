@@ -51,21 +51,9 @@ static const char *TAG = "narbis_central";
 
 #define NARBIS_GATTC_APP_ID        0x55  /* arbitrary; distinct from gatts app */
 
-/* Directed scan window for the persisted earclip MAC. Bumped from
- * 5 s to 30 s so the glasses are scanning ~86 % of the time after
- * a wake/disconnect (was ~14 % with 5 s scan + 30 s backoff). The
- * window where the earclip can wake from sleep / re-enter range
- * and not be picked up nearly disappears. Bluedroid scanning at
- * default duty cycle is small change vs the LED + lens drive, so
- * the battery cost is negligible. */
-#define SCAN_DIRECTED_S            30
+#define SCAN_DIRECTED_S            5
 #define SCAN_GENERAL_S             30
-/* Backoff between failed directed-scan windows. Was 30 s, which
- * combined with the 5 s scan meant up to 35 s before the next
- * chance to catch a freshly-advertising earclip. 5 s gives a
- * 30 + 5 = 35 s scan/idle ratio of 86/14 — most of the time the
- * radio is listening. */
-#define RECONNECT_BACKOFF_MS       5000
+#define RECONNECT_BACKOFF_MS       30000
 
 /* CCCD descriptor UUID (BLE-spec well-known). */
 #define BLE_UUID_CCCD              0x2902
@@ -87,10 +75,9 @@ typedef enum {
 } central_state_t;
 
 typedef struct {
-    uint8_t              bda[6];
-    esp_ble_addr_type_t  addr_type;  /* captured from scan; needed for gattc_open */
-    int                  rssi;
-    bool                 valid;
+    uint8_t  bda[6];
+    int      rssi;
+    bool     valid;
 } scan_best_t;
 
 static struct {
@@ -127,13 +114,8 @@ static struct {
     uint16_t hdl_diag_cccd;
 
     /* Pairing target. */
-    uint8_t              earclip_mac[6];
-    esp_ble_addr_type_t  earclip_addr_type;  /* PUBLIC by default; populated from scan match
-                                              * — without this, gattc_open against a peer with
-                                              * a random address (NimBLE default on ESP32-C6 when
-                                              * no public BD_ADDR is in OTP) silently never fires
-                                              * OPEN_EVT and the central looks "stuck after persist". */
-    bool                 earclip_known;
+    uint8_t  earclip_mac[6];
+    bool     earclip_known;
 
     /* General-scan winner-tracking. */
     scan_best_t best;
@@ -161,6 +143,12 @@ static struct {
     uint32_t notify_raw_count;
     uint32_t notify_diag_count;
     uint32_t notify_other_count;
+
+    /* When true, the central is paused (e.g. dashboard set HR source to
+     * H10 — no need to keep scanning for earclip). Stops scans/backoff
+     * timers from running and prevents disconnect-event auto-restart.
+     * Cleared by narbis_central_start(). */
+    bool paused;
 } S;
 
 /* ---- log sink + state callback helpers ------------------------------- */
@@ -307,6 +295,10 @@ static void schedule_reconnect_backoff(void) {
 
 static void backoff_timer_cb(void *arg) {
     (void)arg;
+    if (S.paused) {
+        ESP_LOGI(TAG, "central: backoff fired but paused — skipping scan");
+        return;
+    }
     if (S.earclip_known) start_scan_directed();
     else                 start_scan_general();
 }
@@ -596,19 +588,11 @@ void narbis_central_gap_event(esp_gap_ble_cb_event_t event,
                            (unsigned)S.scan_advs_matched);
                     if (S.best.valid) {
                         memcpy(S.earclip_mac, S.best.bda, 6);
-                        S.earclip_addr_type = S.best.addr_type;
                         S.earclip_known = true;
                         (void)nvs_write_earclip(S.earclip_mac);
-                        cb_log("central: best rssi=%d addr_type=%d, persisted",
-                               S.best.rssi, (int)S.earclip_addr_type);
+                        cb_log("central: best rssi=%d, persisted", S.best.rssi);
                         S.state = ST_CONNECTING;
-                        esp_err_t oerr = esp_ble_gattc_open(S.gattc_if, S.earclip_mac,
-                                                            S.earclip_addr_type, true);
-                        if (oerr != ESP_OK) {
-                            cb_log("central: gattc_open rc=%s — backing off",
-                                   esp_err_to_name(oerr));
-                            schedule_reconnect_backoff();
-                        }
+                        esp_ble_gattc_open(S.gattc_if, S.earclip_mac, BLE_ADDR_TYPE_PUBLIC, true);
                     } else {
                         schedule_reconnect_backoff();
                     }
@@ -632,16 +616,7 @@ void narbis_central_gap_event(esp_gap_ble_cb_event_t event,
                 esp_ble_gap_stop_scanning();
                 S.state = ST_CONNECTING;
                 S.last_seen_us = esp_timer_get_time();
-                /* Refresh address type from this scan hit — survives the
-                 * NVS-load cold-boot case where we know the MAC but not its type. */
-                S.earclip_addr_type = r->ble_addr_type;
-                esp_err_t oerr = esp_ble_gattc_open(S.gattc_if, S.earclip_mac,
-                                                    S.earclip_addr_type, true);
-                if (oerr != ESP_OK) {
-                    cb_log("central: gattc_open rc=%s — backing off",
-                           esp_err_to_name(oerr));
-                    schedule_reconnect_backoff();
-                }
+                esp_ble_gattc_open(S.gattc_if, S.earclip_mac, BLE_ADDR_TYPE_PUBLIC, true);
             }
         } else if (S.state == ST_SCANNING_GENERAL) {
             if (adv_contains_narbis_svc(r->ble_adv, r->adv_data_len + r->scan_rsp_len)) {
@@ -656,7 +631,6 @@ void narbis_central_gap_event(esp_gap_ble_cb_event_t event,
                 if (!S.best.valid || r->rssi > S.best.rssi) {
                     S.best.valid = true;
                     S.best.rssi = r->rssi;
-                    S.best.addr_type = r->ble_addr_type;
                     memcpy(S.best.bda, r->bda, 6);
                 }
             }
@@ -862,8 +836,12 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         S.notify_diag_count = S.notify_other_count = 0;
         /* Avoid re-issuing scan if forget()/start() already kicked one
          * off. Without this guard, a forced disconnect during a fresh
-         * scan would restart that scan and lose progress. */
-        if (S.state != ST_SCANNING_DIRECTED && S.state != ST_SCANNING_GENERAL) {
+         * scan would restart that scan and lose progress. Also skip
+         * entirely when paused (HR-source switched to H10) — the
+         * disconnect was intentional and we shouldn't reconnect. */
+        if (S.paused) {
+            S.state = ST_IDLE;
+        } else if (S.state != ST_SCANNING_DIRECTED && S.state != ST_SCANNING_GENERAL) {
             if (S.earclip_known) start_scan_directed();
             else                 start_scan_general();
         }
@@ -907,6 +885,13 @@ esp_err_t narbis_central_init(narbis_central_ibi_cb_t     ibi_cb,
 }
 
 esp_err_t narbis_central_start(void) {
+    /* Clear paused state in case we're resuming after a stop() — the
+     * dashboard flipped HR source back to earclip. Idempotent if already
+     * unpaused. */
+    if (S.paused) {
+        ESP_LOGI(TAG, "central: resuming (was paused)");
+        S.paused = false;
+    }
     uint8_t mac[6];
     if (nvs_read_earclip(mac) == ESP_OK) {
         memcpy(S.earclip_mac, mac, 6);
@@ -919,6 +904,27 @@ esp_err_t narbis_central_start(void) {
         ESP_LOGI(TAG, "central: no paired earclip — general scan");
         start_scan_general();
     }
+    return ESP_OK;
+}
+
+esp_err_t narbis_central_stop(void) {
+    ESP_LOGI(TAG, "central: stop (HR source switched away from earclip)");
+    S.paused = true;
+    /* Close any active connection; the DISCONNECT_EVT handler sees
+     * S.paused=true and skips the auto-restart-scan. */
+    if (S.conn_id) {
+        esp_ble_gattc_close(S.gattc_if, S.conn_id);
+    }
+    /* Cancel any in-flight scan. */
+    if (S.state == ST_SCANNING_DIRECTED || S.state == ST_SCANNING_GENERAL) {
+        esp_ble_gap_stop_scanning();
+    }
+    /* Drop the backoff timer so a pending tick doesn't relaunch a scan. */
+    if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
+    S.scan_attempts = 0;
+    /* Leave earclip_known + earclip_mac intact so a subsequent
+     * narbis_central_start() can resume directed scan to the same earclip
+     * without re-pairing. */
     return ESP_OK;
 }
 
@@ -1024,23 +1030,6 @@ void narbis_central_emit_diag(void) {
                S.conn_id);
         enter_ready();
     }
-}
-
-esp_err_t narbis_central_request_config_read(void) {
-    /* Need an active connection (conn_id != 0) and a discovered CONFIG
-     * handle. Both are populated by the discovery chain in gattc_cb.
-     * State doesn't need to be exactly ST_READY — self-heal can leave
-     * us in a transient state with handles cached but state pre-READY,
-     * and the caller (dashboard via 0xC5) has no way to know which.
-     * The READ_CHAR_EVT handler dispatches the result through config_cb
-     * regardless of state. */
-    if (S.conn_id == 0 || S.hdl_config == 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    esp_err_t err = esp_ble_gattc_read_char(
-        S.gattc_if, S.conn_id, S.hdl_config, ESP_GATT_AUTH_REQ_NONE);
-    cb_log("central: config re-read requested rc=%d", err);
-    return err;
 }
 
 esp_err_t narbis_central_write_earclip_config(const uint8_t *bytes, size_t len) {
