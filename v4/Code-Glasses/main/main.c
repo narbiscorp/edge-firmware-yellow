@@ -3988,13 +3988,30 @@ static void process_command(uint8_t *data, uint16_t len) {
             break;
             
         /* ── STROBE PARAMS ─────────────────────────────────── */
-        case 0xAB:  /* Set strobe frequency */
-            if (arg < MIN_STROBE_HZ) arg = MIN_STROBE_HZ;
-            if (arg > MAX_STROBE_HZ) arg = MAX_STROBE_HZ;
-            strobe_dhz = arg * 10;
-            strobe_update();
-            prefs_set_u8(KEY_STROBE_DHZ, arg);
-            ESP_LOGI(TAG, "Strobe freq: %dHz (saved)", arg);
+        case 0xAB:  /* Set strobe frequency. Two wire forms:
+                     *   len==2: [0xAB][Hz u8]      — integer Hz (legacy)
+                     *   len==3: [0xAB][deci-Hz LE] — 0.1 Hz precision (new)
+                     * 0.1 Hz precision matters for brainwave-entrainment
+                     * presets (13.5 Hz alpha-beta edge, 17.5 Hz beta, etc.)
+                     * where the integer rounding loses the targeted band. */
+            {
+                uint16_t dhz;
+                if (len >= 3) {
+                    dhz = (uint16_t)data[1] | ((uint16_t)data[2] << 8);
+                } else {
+                    dhz = (uint16_t)arg * 10;
+                }
+                if (dhz < (uint16_t)(MIN_STROBE_HZ * 10)) dhz = MIN_STROBE_HZ * 10;
+                if (dhz > (uint16_t)(MAX_STROBE_HZ * 10)) dhz = MAX_STROBE_HZ * 10;
+                strobe_dhz = dhz;
+                strobe_update();
+                /* Persist as the existing u8 Hz key for backwards-compat
+                 * with the prefs_load path. We lose the 0.1 Hz across a
+                 * reboot — acceptable for v1; if it matters, a follow-up
+                 * adds a u16 deci-Hz NVS key alongside. */
+                prefs_set_u8(KEY_STROBE_DHZ, (uint8_t)((dhz + 5) / 10));
+                ESP_LOGI(TAG, "Strobe freq: %u.%uHz (saved)", dhz / 10, dhz % 10);
+            }
             break;
             
         case 0xAC:  /* Set strobe duty cycle */
