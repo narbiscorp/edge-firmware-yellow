@@ -51,9 +51,13 @@ static const char *TAG = "narbis_central";
 
 #define NARBIS_GATTC_APP_ID        0x55  /* arbitrary; distinct from gatts app */
 
-#define SCAN_DIRECTED_S            5
+/* Directed scan window for the persisted earclip MAC. 30 s scan + 5 s
+ * backoff keeps the radio listening ~86 % of the time, so a wake/re-
+ * entry of the earclip is caught within ~5 s. Earlier 5 s/30 s ratio
+ * pushed worst-case reconnect to 35 s. */
+#define SCAN_DIRECTED_S            30
 #define SCAN_GENERAL_S             30
-#define RECONNECT_BACKOFF_MS       30000
+#define RECONNECT_BACKOFF_MS       5000
 
 /* CCCD descriptor UUID (BLE-spec well-known). */
 #define BLE_UUID_CCCD              0x2902
@@ -75,9 +79,10 @@ typedef enum {
 } central_state_t;
 
 typedef struct {
-    uint8_t  bda[6];
-    int      rssi;
-    bool     valid;
+    uint8_t              bda[6];
+    esp_ble_addr_type_t  addr_type;  /* captured from scan; needed for gattc_open */
+    int                  rssi;
+    bool                 valid;
 } scan_best_t;
 
 static struct {
@@ -114,8 +119,13 @@ static struct {
     uint16_t hdl_diag_cccd;
 
     /* Pairing target. */
-    uint8_t  earclip_mac[6];
-    bool     earclip_known;
+    uint8_t              earclip_mac[6];
+    esp_ble_addr_type_t  earclip_addr_type;  /* PUBLIC by default; populated from scan match
+                                              * — without this, gattc_open against a peer with
+                                              * a random address (NimBLE default on ESP32-C6 when
+                                              * no public BD_ADDR is in OTP) silently never fires
+                                              * OPEN_EVT and the central looks "stuck after persist". */
+    bool                 earclip_known;
 
     /* General-scan winner-tracking. */
     scan_best_t best;
@@ -588,11 +598,19 @@ void narbis_central_gap_event(esp_gap_ble_cb_event_t event,
                            (unsigned)S.scan_advs_matched);
                     if (S.best.valid) {
                         memcpy(S.earclip_mac, S.best.bda, 6);
+                        S.earclip_addr_type = S.best.addr_type;
                         S.earclip_known = true;
                         (void)nvs_write_earclip(S.earclip_mac);
-                        cb_log("central: best rssi=%d, persisted", S.best.rssi);
+                        cb_log("central: best rssi=%d addr_type=%d, persisted",
+                               S.best.rssi, (int)S.earclip_addr_type);
                         S.state = ST_CONNECTING;
-                        esp_ble_gattc_open(S.gattc_if, S.earclip_mac, BLE_ADDR_TYPE_PUBLIC, true);
+                        esp_err_t oerr = esp_ble_gattc_open(S.gattc_if, S.earclip_mac,
+                                                            S.earclip_addr_type, true);
+                        if (oerr != ESP_OK) {
+                            cb_log("central: gattc_open rc=%s — backing off",
+                                   esp_err_to_name(oerr));
+                            schedule_reconnect_backoff();
+                        }
                     } else {
                         schedule_reconnect_backoff();
                     }
@@ -613,10 +631,20 @@ void narbis_central_gap_event(esp_gap_ble_cb_event_t event,
         if (S.state == ST_SCANNING_DIRECTED) {
             if (S.earclip_known
                 && memcmp(r->bda, S.earclip_mac, 6) == 0) {
+                /* Refresh on every hit: NVS persists only the MAC, so on a
+                 * cold boot we don't yet know the address type until we see
+                 * the first adv from the saved peer. */
+                S.earclip_addr_type = r->ble_addr_type;
                 esp_ble_gap_stop_scanning();
                 S.state = ST_CONNECTING;
                 S.last_seen_us = esp_timer_get_time();
-                esp_ble_gattc_open(S.gattc_if, S.earclip_mac, BLE_ADDR_TYPE_PUBLIC, true);
+                esp_err_t oerr = esp_ble_gattc_open(S.gattc_if, S.earclip_mac,
+                                                    S.earclip_addr_type, true);
+                if (oerr != ESP_OK) {
+                    cb_log("central: gattc_open rc=%s — backing off",
+                           esp_err_to_name(oerr));
+                    schedule_reconnect_backoff();
+                }
             }
         } else if (S.state == ST_SCANNING_GENERAL) {
             if (adv_contains_narbis_svc(r->ble_adv, r->adv_data_len + r->scan_rsp_len)) {
@@ -631,6 +659,7 @@ void narbis_central_gap_event(esp_gap_ble_cb_event_t event,
                 if (!S.best.valid || r->rssi > S.best.rssi) {
                     S.best.valid = true;
                     S.best.rssi = r->rssi;
+                    S.best.addr_type = r->ble_addr_type;
                     memcpy(S.best.bda, r->bda, 6);
                 }
             }
