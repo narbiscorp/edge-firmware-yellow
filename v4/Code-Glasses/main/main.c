@@ -3158,7 +3158,7 @@ static void ppg_emit_adc_stats(void) {
  * Emits a 0xF3 binary packet at 2Hz with structured system-health data.
  * Dashboard parses and displays in the System Health panel.
  *
- * Packet layout (18 bytes total):
+ * Packet layout (22 bytes total):
  *   [0]       type = 0xF3
  *   [1-4]     uptime_s            u32 LE — seconds since boot
  *   [5-8]     heap_free           u32 LE — current free heap (bytes)
@@ -3167,9 +3167,8 @@ static void ppg_emit_adc_stats(void) {
  *   [15-16]   ble_send_errors     u16 LE — cumulative BLE send failures
  *   [17-18]   jitter_max_us       u16 LE — max tick overrun in last window (µs)
  *   [19]      jitter_ticks_over   u8     — count of ticks >25ms late in window
- *
- * Wait, that's 20 bytes. Let me recount: 1 + 4 + 4 + 4 + 2 + 2 + 2 + 1 = 20.
- * Fine — just larger than 18. BLE MTU easily handles this.
+ *   [20]      led_mode            u8     — current LED_MODE_* enum value
+ *   [21]      led_duty            u8     — effective_duty (0–255 = 0–100% PWM)
  *
  * Window stats (jitter_max_us, jitter_ticks_over) are reset by the
  * existing 5-second heartbeat log block in ppg_task. This health
@@ -3190,7 +3189,7 @@ static void ppg_emit_health(void) {
     uint16_t jit_max16 = (ppg_jitter_max_us > 0xFFFF) ? 0xFFFF : (uint16_t)ppg_jitter_max_us;
     uint8_t  jit_over8 = (ppg_jitter_ticks_over > 0xFF) ? 0xFF : (uint8_t)ppg_jitter_ticks_over;
 
-    uint8_t pkt[20];
+    uint8_t pkt[22];
     pkt[0]  = 0xF3;
     pkt[1]  = (uint8_t)(uptime_s & 0xFF);
     pkt[2]  = (uint8_t)((uptime_s >> 8) & 0xFF);
@@ -3211,6 +3210,8 @@ static void ppg_emit_health(void) {
     pkt[17] = (uint8_t)(jit_max16 & 0xFF);
     pkt[18] = (uint8_t)((jit_max16 >> 8) & 0xFF);
     pkt[19] = jit_over8;
+    pkt[20] = (uint8_t)led_mode;
+    pkt[21] = effective_duty;
 
     nimble_notify(status_char_handle, pkt, sizeof(pkt));
 }
@@ -6053,6 +6054,11 @@ static void ppg_task(void *arg) {
             uint8_t pkt = relay_up ? 1u : 0u;
             send_status_frame(0xF6, &pkt, 1);
             narbis_central_emit_diag();
+        }
+
+        if (now_ms - last_health_ms >= 1000) {
+            last_health_ms = now_ms;
+            ppg_emit_health();
         }
 
         sample_idx++;
