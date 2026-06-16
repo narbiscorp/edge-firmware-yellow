@@ -92,7 +92,10 @@
  *   - B3 [val]            Set hold-at-top 0-50 (×100ms, max 5s)
  *   - B4 [val]            Set hold-at-bottom 0-50
  *   - B5 [wave]           Waveform: 0=sine, 1=linear
- * 
+ *   - BA [ms_lo][ms_hi][inh]  Breathe-sync (v4.15.5+): phase-lock the cosine
+ *                         to the app's breath clock. u16 LE cycle ms + inhale
+ *                         %; restarts the cycle at inhale start (now).
+ *
  *   OTA:
  *   - A8 00               Start OTA mode
  *   - A9 00               Finish OTA (validate + reboot)
@@ -105,6 +108,22 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.15.5 (cue-sync):
+ * - Breathe phase-lock for app-driven Mode A/B. New 0xBA BREATHE_SYNC opcode
+ *   [cycle_ms u16 LE][inhale_pct u8] restarts the LED_MODE_BREATHE cosine at
+ *   the moment of the command (= the dashboard's on-screen inhale boundary)
+ *   and renders at the exact cycle length sent, instead of the free-running
+ *   (tick_count % cycle_ms) phase at integer BPM. The dashboard sends it at
+ *   each breath-cycle boundary + on Mode A/B start / glasses-connect, so the
+ *   glasses lens, the on-screen orb, and the audio chime share one clock.
+ *   Auto-expires 2 cycles after the last sync, so hall-button BREATHE reverts
+ *   to integer-BPM timing. Purely additive — older dashboards never send it.
+ * - Lens slew-rate limiter on LED_MODE_BREATHE effective_duty (<=4%/10ms tick,
+ *   ~250ms full-scale). A phase re-anchor (or rate snap / reconnect) now fades
+ *   to the new waveform value instead of stepping. Normal breathing moves
+ *   <1.5%/tick, so the waveform shape is unaffected; only discontinuities are
+ *   smoothed. Strobe paths (breathe_frac_q8 / ISR) are untouched.
+ *
  * CHANGELOG v4.15.4 (lens-floor):
  * - Lens low-end visibility fix. The electrochromic cell shows no visible
  *   tint for darkness commands 0-25%; it only starts darkening at ~26%
@@ -1540,7 +1559,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.15.4-lens-floor"
+#define FIRMWARE_VERSION "4.15.5-cue-sync"
 static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
@@ -1675,6 +1694,11 @@ static const char *TAG = "SG_v4.14.39";
  ******************************************************************************/
 #define AC_PERIOD_TICKS         1       /* 10ms tick for led_task (breathing mode) */
 #define LED_TICK_MS             10      /* LED task tick for breathe mode */
+/* v4.15.5: max change in LED_MODE_BREATHE lens duty per 10ms tick. Caps how
+ * fast a breathe phase re-anchor (0xBA) moves the lens, so a resync fades
+ * (~250ms full-scale at 4%/tick) instead of snapping. Normal breathing moves
+ * <1.5%/tick, so the waveform itself is unaffected. */
+#define LENS_SLEW_MAX_STEP_PCT  4
 #define AC_HALF_TICKS           50      /* 50 × 100µs = 5ms = 100Hz AC */
 #define PHASE_FULL              100000U /* DDS wrap: 10000 ticks/sec × 10 for deci-Hz */
 #define DEFAULT_SESSION_MIN     30      /* 30 minute session (v4.14.17: was 10) */
@@ -2450,6 +2474,17 @@ static volatile uint8_t breathe_inhale_pct = 40;   /* 10-90% of cycle is inhale 
 static volatile uint8_t breathe_hold_top   = 0;    /* 0-50, units of 100ms */
 static volatile uint8_t breathe_hold_bot   = 0;    /* 0-50, units of 100ms */
 static volatile uint8_t breathe_wave       = 0;    /* 0=sine, 1=linear */
+
+/* v4.15.5 (cue-sync): dashboard-driven breathe phase-lock state. Set by the
+ * 0xBA BREATHE_SYNC opcode; read by led_task's LED_MODE_BREATHE render. While
+ * a sync is fresh, the breathe cosine starts at breathe_phase_origin_tick and
+ * runs at breathe_sync_cycle_ms (exact, from the app) instead of the
+ * free-running tick_count phase at 60000/breathe_bpm. */
+static volatile uint32_t breathe_phase_origin_tick = 0;  /* tick_count at last sync = cosine restart point */
+static volatile uint32_t breathe_sync_cycle_ms     = 0;  /* exact cycle length from app; 0 = use breathe_bpm */
+static volatile uint32_t breathe_sync_last_tick    = 0;  /* tick_count at last 0xBA, for the 2-cycle auto-expire */
+static volatile uint32_t g_led_tick                = 0;  /* led_task mirrors its local tick_count here so the
+                                                          * BLE-task 0xBA handler can snapshot the live phase */
 
 /* Coherence-pipeline tuning struct. Read by coh_compute (bottom of file)
  * and the on_earclip_ibi / 0xCA injectIbi confidence gate; written by the
@@ -3351,6 +3386,10 @@ static void led_task(void *param) {
         xTaskGetTickCount() + pdMS_TO_TICKS(BOOT_INDICATOR_DELAY_MS);
 
     while (1) {
+        /* v4.15.5: publish the breathe tick so the 0xBA handler (BLE task)
+         * can anchor the phase to the current cycle position. */
+        g_led_tick = tick_count;
+
         /* v4.14.3: fire boot indicator once, after the delay, if PPG-auto
          * hasn't preempted. ppg_auto_check sets boot_indicator_shown=true
          * on activation; we also set it true ourselves once the indicator
@@ -3404,7 +3443,17 @@ static void led_task(void *param) {
          * directly (lens tint follows waveform). BREATHE_STROBE publishes
          * breathe_frac_q8 for the ISR to scale strobe dark-phase duty. */
         if (led_mode == LED_MODE_BREATHE || led_mode == LED_MODE_BREATHE_STROBE) {
-            uint32_t cycle_ms = 60000 / breathe_bpm;
+            /* v4.15.5: use the app's exact cycle length while a BREATHE_SYNC is
+             * fresh (within 2 cycles); else fall back to integer-BPM. Keeps the
+             * lens locked to the dashboard breath clock, and lets hall-button
+             * BREATHE revert cleanly once the app stops syncing. */
+            uint32_t cycle_ms;
+            if (breathe_sync_cycle_ms > 0 &&
+                (tick_count - breathe_sync_last_tick) * LED_TICK_MS <= 2u * breathe_sync_cycle_ms) {
+                cycle_ms = breathe_sync_cycle_ms;
+            } else {
+                cycle_ms = 60000 / breathe_bpm;
+            }
             uint32_t hold_top_ms = (uint32_t)breathe_hold_top * 100;
             uint32_t hold_bot_ms = (uint32_t)breathe_hold_bot * 100;
             
@@ -3421,7 +3470,10 @@ static void led_task(void *param) {
             if (inhale_ms < 100) inhale_ms = 100;
             if (exhale_ms < 100) exhale_ms = 100;
             
-            uint32_t t = (tick_count * LED_TICK_MS) % cycle_ms;
+            /* v4.15.5: phase measured from the last sync anchor (0xBA restarts
+             * the cosine at inhale start). origin 0 => free-running, identical
+             * to the pre-sync behavior. */
+            uint32_t t = ((tick_count - breathe_phase_origin_tick) * LED_TICK_MS) % cycle_ms;
             float frac = 0.0f;
             
             if (t < inhale_ms) {
@@ -3445,7 +3497,17 @@ static void led_task(void *param) {
             breathe_frac_q8 = (uint8_t)(frac * 255.0f);
 
             if (led_mode == LED_MODE_BREATHE) {
-                effective_duty = (uint8_t)(frac * (float)brightness);
+                /* v4.15.5: slew-rate limit toward the target so a phase
+                 * re-anchor (or rate snap) fades instead of snapping. Normal
+                 * breathing moves <1.5%/tick, well under the cap, so the
+                 * waveform shape is unchanged; only discontinuities smooth. */
+                uint8_t target = (uint8_t)(frac * (float)brightness);
+                int delta = (int)target - (int)effective_duty;
+                if (delta > LENS_SLEW_MAX_STEP_PCT)
+                    target = (uint8_t)(effective_duty + LENS_SLEW_MAX_STEP_PCT);
+                else if (delta < -LENS_SLEW_MAX_STEP_PCT)
+                    target = (uint8_t)(effective_duty - LENS_SLEW_MAX_STEP_PCT);
+                effective_duty = target;
             }
             /* BREATHE_STROBE: ISR sets effective_duty from breathe_frac_q8 */
         }
@@ -4309,6 +4371,32 @@ static void process_command(uint8_t *data, uint16_t len) {
             ESP_LOGI(TAG, "BLE: adaptive pacer %s (saved)",
                      coh_pacer_adaptive ? "ON" : "OFF");
             ble_log("adaptive = %d", coh_pacer_adaptive);
+            break;
+
+        case 0xBA:  /* v4.15.5: BREATHE_SYNC — phase-lock the breathe cosine
+                     * to the dashboard's breath clock.
+                     *   payload [cycle_ms u16 LE][inhale_pct u8]
+                     * Restarts the LED_MODE_BREATHE cosine at inhale start
+                     * (now) and renders at the exact cycle length sent, so the
+                     * glasses lens matches the on-screen cue + chime. Mode-
+                     * agnostic: it only programs the breathe-render state; the
+                     * dashboard owns mode selection via 0xB0. Transient (not
+                     * persisted). Auto-expires 2 cycles after the last sync. */
+            if (len >= 4) {
+                uint32_t cms = (uint32_t)data[1] | ((uint32_t)data[2] << 8);
+                if (cms < 2000)  cms = 2000;
+                if (cms > 30000) cms = 30000;
+                uint8_t inh = data[3];
+                if (inh < 10) inh = 10;
+                if (inh > 90) inh = 90;
+                breathe_inhale_pct        = inh;
+                breathe_sync_cycle_ms     = cms;
+                breathe_sync_last_tick    = g_led_tick;
+                breathe_phase_origin_tick = g_led_tick;
+                ESP_LOGI(TAG, "BLE: breathe sync cycle=%lums inhale=%u%%",
+                         (unsigned long)cms, inh);
+                ble_log("breathe sync %lums", (unsigned long)cms);
+            }
             break;
 
         case 0xBF:  /* v4.14.30: Factory reset — erase all user preferences
