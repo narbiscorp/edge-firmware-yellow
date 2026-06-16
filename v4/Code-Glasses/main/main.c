@@ -105,6 +105,17 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.15.4 (lens-floor):
+ * - Lens low-end visibility fix. The electrochromic cell shows no visible
+ *   tint for darkness commands 0-25%; it only starts darkening at ~26%
+ *   duty. duty_to_raw() / duty_to_raw_isr() now remap the command range
+ *   1-100% onto the visible raw range [265..1023] linearly, so duty=1
+ *   outputs what duty=26 used to and every command percent moves the lens.
+ *   duty=0 still maps to raw=0 (fully clear / OTA / inactive session).
+ *   Reinstates the pre-v4.14.12 floor concept at the real ~26% threshold.
+ *   Affects every lens mode (static, breathe, coherence, strobe) since all
+ *   drive output funnels through duty_to_raw_isr. See the DUTY → RAW block.
+ *
  * CHANGELOG Path B (replaces v4.14.39 ESP-NOW path):
  * - Glasses now connect to the Narbis earclip as a BLE central, not via
  *   Wi-Fi/ESP-NOW. The Bluedroid stack runs in dual-role mode: peripheral
@@ -1529,7 +1540,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.15.3-link-quality"
+#define FIRMWARE_VERSION "4.15.4-lens-floor"
 static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
@@ -1678,26 +1689,45 @@ static const char *TAG = "SG_v4.14.39";
 /*******************************************************************************
  * DUTY → RAW PWM MAPPING
  *
- * v4.14.12: deadzone compensation removed. Previous firmware had a
- * hardware deadzone that required skipping raw 0-400. That deadzone
- * no longer exists on current hardware, so the skip was producing a
- * visible "snap" at the zero crossing (duty=0 → raw=0 vs duty=1 →
- * raw=406 is a 406-count physical step).
+ * v4.15.4 (lens-floor): re-introduce a low-end visibility floor.
  *
- * Now: straight linear map, duty 0-100 → raw 0-1023.
- *   duty=0   → raw=0    (fully clear)
- *   duty=50  → raw=511  (halfway)
- *   duty=100 → raw=1023 (fully tinted)
+ * History: v4.14.12 removed deadzone compensation on the belief that the
+ * electrochromic cell no longer had a low-end dead band. Field use shows
+ * it does — darkness commands 0-25% produce NO visible tint; the lens
+ * only starts to darken at ~26% duty. Under the straight linear map that
+ * meant the bottom quarter of every command was spent on invisible output.
  *
- * The LCD_DEADZONE_RAW and PWM_MAX_RAW defines are kept for reference
- * but no longer gate the mapping.
+ * Fix: remap the usable command range 1-100% onto the *visible* raw range
+ * [LENS_VISIBLE_FLOOR_RAW .. PWM_MAX_RAW] linearly. duty=1 now outputs what
+ * duty=26 used to, and duty=100 is unchanged at full tint. duty=0 still
+ * maps to raw=0 so "off" / OTA / inactive-session is fully clear
+ * (drive_timer_cb forces effective_duty=0 to clear the lens).
+ *
+ *   duty=0   → raw=0    (fully clear — unchanged)
+ *   duty=1   → raw=265  (was 10; first visible step ≈ old 26%)
+ *   duty=50  → raw=640  (was 511)
+ *   duty=100 → raw=1023 (fully tinted — unchanged)
+ *
+ * Structurally the same shape as the pre-v4.14.12 compensation, but with
+ * the floor placed at the real ~26% threshold (raw 265) instead of the
+ * stale 400, and applied as a smooth linear stretch rather than a hard
+ * raw-0→400 jump at duty=1.
  ******************************************************************************/
-#define LCD_DEADZONE_RAW        400    /* LEGACY: no longer used (v4.14.12) */
+#define LCD_DEADZONE_RAW        400    /* LEGACY: pre-v4.14.12 floor, unused */
 #define PWM_MAX_RAW             1023   /* 10-bit LEDC resolution */
 
+/* Low-end visibility floor (v4.15.4). Electrochromic tint isn't visible
+ * until ~26% duty, so duty 1..100 is linearly remapped onto raw
+ * [LENS_VISIBLE_FLOOR_RAW .. PWM_MAX_RAW]. Expressed as a percent so the
+ * threshold stays readable; the compiler folds it to a constant (265). */
+#define LENS_VISIBLE_FLOOR_PCT  26
+#define LENS_VISIBLE_FLOOR_RAW  (LENS_VISIBLE_FLOOR_PCT * PWM_MAX_RAW / 100)
+
 static inline uint32_t duty_to_raw(uint8_t duty_percent) {
+    if (duty_percent == 0) return 0;                 /* fully clear */
     if (duty_percent > 100) duty_percent = 100;
-    return (uint32_t)duty_percent * PWM_MAX_RAW / 100;
+    return LENS_VISIBLE_FLOOR_RAW +
+           (uint32_t)(duty_percent - 1) * (PWM_MAX_RAW - LENS_VISIBLE_FLOOR_RAW) / 99;
 }
 
 /*******************************************************************************
@@ -2664,10 +2694,15 @@ static void IRAM_ATTR pwm2_set_isr(uint32_t raw_duty) {
 }
 
 static inline uint32_t IRAM_ATTR duty_to_raw_isr(uint8_t duty_pct) {
-    /* v4.14.12: straight linear map, no deadzone skip. See duty_to_raw.
-     * This is the ISR-safe inline used by drive_timer_cb at 10kHz. */
+    /* v4.15.4: low-end visibility floor. Must stay in lock-step with
+     * duty_to_raw() above — identical remap, ISR-safe (used by
+     * drive_timer_cb at 10kHz). duty 0 → raw 0 (clear); duty 1..100 →
+     * [LENS_VISIBLE_FLOOR_RAW .. PWM_MAX_RAW]. Constants fold at compile
+     * time, so this is one mul + one div, same cost as the old map. */
+    if (duty_pct == 0) return 0;
     if (duty_pct > 100) duty_pct = 100;
-    return (uint32_t)duty_pct * 1023 / 100;
+    return LENS_VISIBLE_FLOOR_RAW +
+           (uint32_t)(duty_pct - 1) * (PWM_MAX_RAW - LENS_VISIBLE_FLOOR_RAW) / 99;
 }
 
 /*******************************************************************************
