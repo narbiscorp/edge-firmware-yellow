@@ -2586,6 +2586,7 @@ static volatile bool in_ota_mode = false;
 static const esp_partition_t *ota_partition = NULL;
 static esp_ota_handle_t ota_handle = 0;
 static uint32_t ota_bytes_written = 0;
+static uint32_t ota_expected_size = 0;  /* image size from 0xA8 payload; 0 = unknown (full-slot erase) */
 
 /* Page-based OTA transfer state */
 static uint8_t ota_page_buf[OTA_PAGE_SIZE];
@@ -3955,7 +3956,17 @@ static void ota_do_begin(void) {
         return;
     }
 
-    esp_err_t err = esp_ota_begin(ota_partition, OTA_SIZE_UNKNOWN, &ota_handle);
+    /* Erase only what the image needs when the host told us its size, instead
+     * of the whole slot. A full-slot erase (~1.5 MB) holds the BLE radio silent
+     * for 6-19 s and, on worn flash, can outrun the supervision timeout and drop
+     * the link mid-erase. Fall back to a full erase for legacy hosts (size 0)
+     * or an implausible size. */
+    size_t ota_erase = (ota_expected_size > 0 && ota_expected_size <= ota_partition->size)
+                       ? (size_t)ota_expected_size : OTA_SIZE_UNKNOWN;
+    ESP_LOGI(TAG, "OTA begin: erasing %s (%lu bytes)",
+             (ota_erase == OTA_SIZE_UNKNOWN) ? "full slot" : "image-sized",
+             (unsigned long)((ota_erase == OTA_SIZE_UNKNOWN) ? ota_partition->size : ota_erase));
+    esp_err_t err = esp_ota_begin(ota_partition, ota_erase, &ota_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "OTA begin failed: %s", esp_err_to_name(err));
         send_ota_status(OTA_STATUS_ERROR, OTA_ERR_BEGIN, 0, 0);
@@ -4192,8 +4203,17 @@ static void process_command(uint8_t *data, uint16_t len) {
             break;
             
         /* ── OTA ───────────────────────────────────────────── */
-        case 0xA8:  /* Start OTA (deferred to OTA task) */
-            ESP_LOGI(TAG, "OTA: Start command (deferred)");
+        case 0xA8:  /* Start OTA (deferred to OTA task).
+                     * Optional payload [0xA8][size LE32]: the host's image size,
+                     * used by ota_do_begin() to erase only the sectors the image
+                     * needs instead of the whole slot. Legacy hosts send
+                     * [0xA8,0x00] (len 2) → size 0 → full-slot erase. */
+            ota_expected_size = (len >= 5)
+                ? ((uint32_t)data[1] | ((uint32_t)data[2] << 8) |
+                   ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24))
+                : 0;
+            ESP_LOGI(TAG, "OTA: Start command (deferred), image_size=%lu",
+                     (unsigned long)ota_expected_size);
             session_active = false;
             strobe_stop();
             effective_duty = 0;
@@ -4872,16 +4892,19 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
             ble_idle_deadline_tick = 0;
             ESP_LOGI(TAG, "Client connected, conn_handle %d", g_conn_handle);
 
-            /* Dashboard conn-update. v4.10.1: 20 s supervision (OTA erase
-             * holds the radio silent up to 19 s). v4.12.8: 20-30 ms
-             * interval, latency=1 for balanced power + throughput. NimBLE
-             * units match Bluedroid: itvl_* in 1.25 ms units, latency in
+            /* Dashboard conn-update. Supervision 32 s (BLE max): the OTA begin
+             * erase holds the radio silent, and on worn flash that erase has
+             * crept past the old 20 s and dropped the link mid-erase. Paired
+             * with the size-bounded erase in ota_do_begin() (which shrinks the
+             * erase well under the window) this is belt-and-braces. v4.12.8:
+             * 20-30 ms interval, latency=1 for balanced power + throughput.
+             * NimBLE units match Bluedroid: itvl_* in 1.25 ms units, latency in
              * conn events, supervision_timeout in 10 ms units. */
             struct ble_gap_upd_params upd = {
                 .itvl_min            = 0x10,    /* 20 ms */
                 .itvl_max            = 0x18,    /* 30 ms */
                 .latency             = 1,
-                .supervision_timeout = 2000,    /* 20 s */
+                .supervision_timeout = 3200,    /* 32 s (BLE max) */
                 .min_ce_len          = 0,
                 .max_ce_len          = 0,
             };
