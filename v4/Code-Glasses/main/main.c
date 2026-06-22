@@ -87,6 +87,7 @@
  *   - AC [duty_pct]       Set strobe duty cycle 10-90% (% of period dark)
  * 
  *   BREATHE PARAMS (take effect immediately):
+ *   - B0 [mode]           Enter BREATHE (0 / no arg) or BREATHE+STROBE (1, v4.15.6+)
  *   - B1 [bpm]            Set breathing rate 1-30 BPM
  *   - B2 [pct]            Set inhale ratio 10-90%
  *   - B3 [val]            Set hold-at-top 0-50 (×100ms, max 5s)
@@ -108,6 +109,22 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.15.6 (strobe-sync):
+ * - App-paced breath+strobe. 0xB0 now takes an arg: 0xB0 0x01 enters
+ *   LED_MODE_BREATHE_STROBE (standalone breathe+strobe), which shares the same
+ *   0xBA-anchored breathe cosine as plain BREATHE — so an app driving the breath
+ *   via 0xB1/0xB2/0xA2 + 0xBA gets a phase-LOCKED strobe, instead of the
+ *   self-paced PPG program 4 (COHERENCE_BREATHE_STROBE) that ignored 0xBA and
+ *   reset its cycle on entry (the dashboard's out-of-sync breath+strobe bug).
+ *   Toggling 0xB0 0<->1 leaves breathe_phase_origin_tick untouched, so switching
+ *   breathing-guide <-> breath+strobe stays in phase. 0xB0 0x00 (or no arg) is
+ *   unchanged. Strobe dark-burst duty scales with brightness (0xA2), so depth 0
+ *   (e.g. Mode B/C settling) renders fully clear — no strobe.
+ * - BLE program changes (0xB7) no longer pulse the lens program indicator: the
+ *   app switches programs silently and immediately. The N-pulse "which program"
+ *   indicator is now hall-tap-only (hall short-tap advance + 5-tap forget keep
+ *   their pulses) — the only feedback a standalone, app-less user gets.
+ *
  * CHANGELOG v4.15.5 (cue-sync):
  * - Breathe phase-lock for app-driven Mode A/B. New 0xBA BREATHE_SYNC opcode
  *   [cycle_ms u16 LE][inhale_pct u8] restarts the LED_MODE_BREATHE cosine at
@@ -1559,7 +1576,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.15.5-cue-sync"
+#define FIRMWARE_VERSION "4.15.6-strobe-sync"
 static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
@@ -4277,12 +4294,28 @@ static void process_command(uint8_t *data, uint16_t len) {
             break;
             
         /* ── BREATHE MODE + PARAMS ─────────────────────────── */
-        case 0xB0:  /* Enter BREATHE mode */
-            strobe_stop();
-            led_mode = LED_MODE_BREATHE;
-            ESP_LOGI(TAG, "Mode: BREATHE %dBPM %d/%d %s", 
-                     breathe_bpm, breathe_inhale_pct, 100 - breathe_inhale_pct,
-                     breathe_wave == 0 ? "sine" : "linear");
+        case 0xB0:  /* Enter BREATHE (arg 0) or BREATHE+STROBE (arg 1) mode.
+                     * v4.15.6: arg 1 enters LED_MODE_BREATHE_STROBE, which shares
+                     * the exact 0xBA-anchored breathe cosine above — so an app
+                     * pacing the breath via 0xB1/0xB2/0xA2 + 0xBA gets a phase-
+                     * locked breath+strobe, unlike the self-paced PPG program 4
+                     * (COHERENCE_BREATHE_STROBE). Toggling 0xB0 0<->1 leaves
+                     * breathe_phase_origin_tick untouched, so the breath stays in
+                     * phase across the switch. Strobe shape via 0xAB/0xAC; the
+                     * dark-burst duty scales with brightness (0xA2), so depth 0
+                     * (e.g. Mode B/C settling) renders fully clear — no strobe. */
+            if (arg == 1) {
+                led_mode = LED_MODE_BREATHE_STROBE;
+                if (session_active) strobe_start();
+                ESP_LOGI(TAG, "Mode: BREATHE+STROBE %dBPM %d/%d (app-paced)",
+                         breathe_bpm, breathe_inhale_pct, 100 - breathe_inhale_pct);
+            } else {
+                strobe_stop();
+                led_mode = LED_MODE_BREATHE;
+                ESP_LOGI(TAG, "Mode: BREATHE %dBPM %d/%d %s",
+                         breathe_bpm, breathe_inhale_pct, 100 - breathe_inhale_pct,
+                         breathe_wave == 0 ? "sine" : "linear");
+            }
             break;
             
         case 0xB1:  /* Set breathe BPM */
@@ -4352,7 +4385,10 @@ static void process_command(uint8_t *data, uint16_t len) {
                             (int)saved_hall_program);
                 }
                 ppg_apply_program(target);
-                indicator_trigger((uint8_t)(target + 1), 0);
+                /* v4.15.6: no indicator pulse on a BLE program change — the app
+                 * switches programs silently and immediately. The N-pulse program
+                 * indicator is reserved for HALL-tap changes (see hall_task),
+                 * where it's the only feedback the standalone user gets. */
                 ESP_LOGI(TAG, "BLE: set PPG program %d", arg);
             } else {
                 ESP_LOGW(TAG, "BLE: 0xB7 arg %d out of range [0,%d)",
