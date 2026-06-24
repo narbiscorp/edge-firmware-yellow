@@ -59,6 +59,12 @@ static const char *TAG = "narbis_central";
 #define NARBIS_NVS_NS              "narbis_pair"
 #define NARBIS_NVS_KEY_EARCLIP_MAC "earclip_mac"
 
+/* Earclip BLE-central scanning. Set to 0 to disable all scanning for the
+ * earclip — the glasses still advertise to the dashboard, but the central
+ * radio stays dark, eliminating the ~80 mA active-scan drain when no earclip
+ * is in use. Flip back to 1 when the earclip is reintroduced. */
+#define EARCLIP_CENTRAL_ENABLED 0
+
 /* Directed scan window for the persisted earclip MAC. 30 s window + ~5 s
  * backoff keeps the radio listening most of the time so a wake/re-entry
  * of the earclip is caught within ~5 s. */
@@ -1113,6 +1119,11 @@ esp_err_t narbis_central_init(narbis_central_ibi_cb_t     ibi_cb,
 }
 
 esp_err_t narbis_central_start(void) {
+#if !EARCLIP_CENTRAL_ENABLED
+    ESP_LOGI(TAG, "central: earclip searching disabled (compile-time) — not scanning");
+    S.paused = true;   /* keep backoff/disconnect auto-restart inert too */
+    return ESP_OK;
+#endif
     if (S.paused) {
         ESP_LOGI(TAG, "central: resuming (was paused)");
         S.paused = false;
