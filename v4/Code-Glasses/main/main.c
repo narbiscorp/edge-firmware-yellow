@@ -1643,8 +1643,14 @@ static const char *TAG = "SG_v4.14.39";
  * BLE menu and connect when handing the glasses to someone new for a
  * session. 5 minutes covers the realistic "try to connect" window
  * without meaningfully impacting battery if the user just forgets to
- * pair at all. */
-#define BLE_IDLE_TIMEOUT_MS     300000
+ * pair at all.
+ *
+ * Reduced to 120s (2 min) for battery: teardown now powers the radio
+ * fully cold (see ble_stack_teardown — nimble_port_deinit disables the
+ * BT controller), so leaving it up for 5 min is pure waste when nobody
+ * connects. Any hall event (tap or hold edge) re-arms BLE and resets the
+ * window, so the device is still easy to reconnect after teardown. */
+#define BLE_IDLE_TIMEOUT_MS     120000
 
 /*******************************************************************************
  * HARDWARE CONFIGURATION
@@ -5151,11 +5157,38 @@ static esp_err_t ble_stack_init(void) {
 
 static esp_err_t ble_stack_teardown(void) {
     if (!ble_stack_up) return ESP_OK;
-    ESP_LOGI(TAG, "BLE stack teardown (adv stop)");
+    ESP_LOGI(TAG, "BLE stack teardown (full radio power-down)");
     if (ble_adv_active) {
         ble_gap_adv_stop();
         ble_adv_active = false;
     }
+
+    /* Actually power the radio down, not just stop advertising. The prior
+     * version only called ble_gap_adv_stop(), which left the BT controller
+     * enabled and idling (a few mA) despite the "radio cold" comments —
+     * that asymmetry was a NimBLE-migration leftover. Now we stop the host
+     * and deinit the controller:
+     *   nimble_port_stop()   — unblocks ble_host_task's nimble_port_run();
+     *                          the task then self-deletes via the trailing
+     *                          nimble_port_freertos_deinit() (line ~5066).
+     *   nimble_port_deinit() — esp_nimble_deinit() + esp_bt_controller_disable()
+     *                          + esp_bt_controller_deinit() → controller cold.
+     * Clearing nimble_port_initialized forces ble_stack_init() to do a full
+     * cold re-init (controller init+enable, services, host task) the next
+     * time BLE is re-armed (boot, hall wake/tap). NB: the earclip central is
+     * dormant (EARCLIP_CENTRAL_ENABLED=0) so the deinit doesn't disrupt it;
+     * if it is ever re-enabled, the re-arm path must also re-init the central. */
+    int rc = nimble_port_stop();
+    if (rc == 0) {
+        esp_err_t derr = nimble_port_deinit();
+        if (derr != ESP_OK) {
+            ESP_LOGE(TAG, "nimble_port_deinit failed: %s", esp_err_to_name(derr));
+        }
+        nimble_port_initialized = false;
+    } else {
+        ESP_LOGW(TAG, "nimble_port_stop rc=%d — controller left up", rc);
+    }
+
     ble_stack_up = false;
     is_connected = false;
     g_conn_handle = 0xFFFF;
