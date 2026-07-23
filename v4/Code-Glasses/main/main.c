@@ -109,6 +109,26 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.17.0 (yellow-dither) — YELLOW LENS BUILD (LENS_BRIDGE=1):
+ * - Temporal tint dither. v4.16.0's drive<->brake remap fixed clear/dark but
+ *   tint was still BINARY: full clear <=57% duty, full dark >=58%. Cause is
+ *   the cell itself — a bistable normally-white GH cell (Hexing: intermediate
+ *   states "not allowed because of not stable"). Its E-O curve snaps around
+ *   ~5V RMS (6.6·sqrt(0.575)≈5.0V = the 57/58% cliff), so ANY amplitude-PWM
+ *   tint at the 10kHz carrier reads as 1-bit. Fix (bench-validated: 50Hz
+ *   strobe + full brightness + duty modulation): render intermediate tint as
+ *   a temporal full-drive/brake PWM at DITHER_DHZ (50Hz), slow enough that
+ *   the cell's optical response integrates it to a stable mid density, fast
+ *   enough to sit above flicker fusion. The 10kHz amplitude render is replaced
+ *   by a 1-bit dither in drive_timer_cb; effective_duty (0..100) becomes the
+ *   dither on-fraction. Every mode benefits (static, breathe sine, coherence,
+ *   indicator fades) with NO change to how those modes compute effective_duty.
+ *   Full-depth strobe passes through untouched (100%->always on, 0%->off), so
+ *   the 40Hz neurofeedback strobe is unchanged. DC balance: AC start polarity
+ *   alternates at each dither on-edge (strobe's own AC reset is skipped for the
+ *   bridge). Gray/direct-drive path reverts to the pre-bridge amplitude
+ *   mapping — only the yellow build dithers.
+ *
  * CHANGELOG v4.16.0 (yellow-bridge) — YELLOW LENS BUILD (LENS_BRIDGE=1):
  * - Drive remap for the LM2665+DRV8837 HV bridge board (yellow GH cell,
  *   HXP-RL26313AM, ±6.6V across cell). The old mapping chopped one pin at
@@ -1595,7 +1615,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.16.0-yellow-bridge"
+#define FIRMWARE_VERSION "4.17.0-yellow-dither"
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
  * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
@@ -1749,6 +1769,12 @@ static const char *TAG = "SG_v4.14.39";
 #define LENS_SLEW_MAX_STEP_PCT  4
 #define AC_HALF_TICKS           50      /* 50 × 100µs = 5ms = 100Hz AC */
 #define PHASE_FULL              100000U /* DDS wrap: 10000 ticks/sec × 10 for deci-Hz */
+/* v4.17.0: tint-dither carrier for the yellow bistable cell (LENS_BRIDGE).
+ * deci-Hz, same DDS convention as strobe_dhz. 500 = 50.0Hz — the rate found
+ * on the bench to integrate to smooth mid-tint without visible flicker.
+ * Tunable: lower = deeper modulation but more flicker; higher = smoother but
+ * the cell can't fully switch so depth compresses back toward binary. */
+#define DITHER_DHZ              500
 #define DEFAULT_SESSION_MIN     30      /* 30 minute session (v4.14.17: was 10) */
 #define DEFAULT_BRIGHTNESS      100     /* 100% brightness */
 #define DEFAULT_STROBE_DHZ      100       /* 10Hz default strobe (deci-Hz) */
@@ -2638,6 +2664,23 @@ static volatile uint32_t strobe_acc = 0;  /* DDS phase accumulator */
 static volatile uint8_t strobe_was_dark = 0;
 static volatile uint8_t ac_reset_polarity = 0;
 
+#if LENS_BRIDGE
+/* v4.17.0 tint-dither state (yellow bistable GH cell).
+ * The yellow cell has no stable intermediate optical state — its E-O curve
+ * snaps around ~5V RMS, so amplitude-PWM tint reads as binary (full clear
+ * below ~57% duty, full dark above). Instead we render an intermediate
+ * effective_duty (0..100) as a temporal full-drive/brake PWM at DITHER_DHZ.
+ * That rate sits BELOW the cell's electrical-RMS regime but comparable to
+ * its optical response, so the cell integrates the switching into a stable
+ * mid tint (and above flicker fusion, so the eye doesn't see it). Generalises
+ * the bench recipe (50Hz strobe + full brightness + duty modulation) to every
+ * mode: static level, breathe sine, coherence opacity all pass effective_duty
+ * as the dither on-fraction. Full-depth strobe (effective_duty already 0/100)
+ * passes through unchanged — 100% dither = always on, 0% = always off. */
+static volatile uint32_t dither_acc = 0;   /* DDS phase accumulator */
+static volatile uint8_t  dither_was_on = 0;
+#endif
+
 /* OTA state */
 static volatile bool in_ota_mode = false;
 static const esp_partition_t *ota_partition = NULL;
@@ -2845,12 +2888,17 @@ static bool IRAM_ATTR drive_timer_cb(gptimer_handle_t timer,
 
         /* On clear→dark transition: reset AC phase with alternating polarity.
          * This makes every dark burst identical in magnitude (no beat) while
-         * alternating consecutive bursts keeps DC balance across burst pairs. */
+         * alternating consecutive bursts keeps DC balance across burst pairs.
+         * v4.17.0: on LENS_BRIDGE the tint-dither owns the AC phase reset (its
+         * on-edge subsumes the strobe's dark-edge when effective_duty is
+         * binary), so skip it here to avoid two writers fighting. */
+#if !LENS_BRIDGE
         if (is_dark && !strobe_was_dark) {
             ac_tick = 0;
             ac_phase = ac_reset_polarity;
             ac_reset_polarity ^= 1;
         }
+#endif
         strobe_was_dark = is_dark;
 
         if (led_mode == LED_MODE_BREATHE_STROBE ||
@@ -2870,23 +2918,38 @@ static bool IRAM_ATTR drive_timer_cb(gptimer_handle_t timer,
         }
     }
 
-    /* ── AC alternation ── */
+#if LENS_BRIDGE
+    /* ── Tint dither (yellow bistable cell) ──
+     * Render effective_duty (0..100) as a temporal full-drive/brake PWM at
+     * DITHER_DHZ instead of an amplitude. The cell integrates the switching
+     * into a stable intermediate optical density (see the state decl above).
+     * raw is therefore always full-scale or zero — never an intermediate
+     * amplitude, which this cell can't hold. */
+    dither_acc += DITHER_DHZ;
+    if (dither_acc >= PHASE_FULL) dither_acc -= PHASE_FULL;
+    uint8_t tint = effective_duty;
+    if (tint > 100) tint = 100;
+    uint8_t is_on = (dither_acc < (uint32_t)tint * (PHASE_FULL / 100)) ? 1 : 0;
+
+    /* DC balance: alternate AC start polarity at each off→on edge so every
+     * on-burst pairs with an opposite-polarity neighbour (mirrors the strobe
+     * phase-sync, but keyed off the dither so it's correct at any tint). */
+    if (is_on && !dither_was_on) {
+        ac_tick = 0;
+        ac_phase = ac_reset_polarity;
+        ac_reset_polarity ^= 1;
+    }
+    dither_was_on = is_on;
+
+    /* ── AC alternation (still flips within long on-bursts) ── */
     ac_tick++;
     if (ac_tick >= AC_HALF_TICKS) {
         ac_tick = 0;
         ac_phase = !ac_phase;
     }
 
-    /* ── Apply PWM with AC phase ── */
-    /* v4.16.0: drive<->brake chop for the DRV8837 bridge (never coast).
-     * Reference pin solid high (PWM_FULL_RAW = true 100%, no 1/1024 glitch),
-     * other pin carries the duty complement:
-     *   both high            -> brake, 0V across cell (raw=0, true clear)
-     *   ref high + other low -> drive (fraction = duty)
-     * Cell RMS = Vdrive × sqrt(duty), actively pulled to 0V between drive
-     * slices — no coast-hold. Same differential waveform as the old mapping
-     * on direct-drive (gray) hardware. */
-    uint32_t raw = duty_to_raw_isr(effective_duty);
+    /* ── Apply: full drive (±6.6V, AC) when on, brake (0V) when off ── */
+    uint32_t raw = is_on ? PWM_MAX_RAW : 0;
     if (ac_phase == 0) {
         pwm1_set_isr(PWM_FULL_RAW);
         pwm2_set_isr(PWM_FULL_RAW - raw);
@@ -2894,6 +2957,24 @@ static bool IRAM_ATTR drive_timer_cb(gptimer_handle_t timer,
         pwm1_set_isr(PWM_FULL_RAW - raw);
         pwm2_set_isr(PWM_FULL_RAW);
     }
+#else
+    /* ── AC alternation ── */
+    ac_tick++;
+    if (ac_tick >= AC_HALF_TICKS) {
+        ac_tick = 0;
+        ac_phase = !ac_phase;
+    }
+
+    /* ── Apply PWM with AC phase (direct-drive gray hardware) ── */
+    uint32_t raw = duty_to_raw_isr(effective_duty);
+    if (ac_phase == 0) {
+        pwm1_set_isr(raw);
+        pwm2_set_isr(1);
+    } else {
+        pwm1_set_isr(1);
+        pwm2_set_isr(raw);
+    }
+#endif
 
     return false;  /* no task wake needed */
 }
