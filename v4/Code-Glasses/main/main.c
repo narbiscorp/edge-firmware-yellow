@@ -109,6 +109,25 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.16.0 (yellow-bridge) — YELLOW LENS BUILD (LENS_BRIDGE=1):
+ * - Drive remap for the LM2665+DRV8837 HV bridge board (yellow GH cell,
+ *   HXP-RL26313AM, ±6.6V across cell). The old mapping chopped one pin at
+ *   10kHz with the idle pin at raw=1: through the DRV8837 (IN/IN) the PWM
+ *   low state is IN 0/0 = COAST — outputs Hi-Z, so the ~nF cell charged to
+ *   full rail on the first pulse of ANY nonzero duty and held it (1M bleed
+ *   τ >> 100µs PWM period). Result: binary tint, and the idle pin's 98ns
+ *   raw=1 blip pumped the cell dark even at duty=0 (reverse pulse into
+ *   coast-hold). New mapping chops drive<->BRAKE: the reference pin holds
+ *   solid high (raw=PWM_FULL_RAW=1024, true 100%) and the other pin carries
+ *   the duty complement. Both-high = brake = hard 0V clear; modulation is
+ *   restored (cell RMS = 6.6V × sqrt(duty)). AC alternation (100Hz) and the
+ *   strobe burst-pair DC balance are unchanged. On bridge-less (gray)
+ *   hardware this mapping produces the identical differential waveform as
+ *   before, so the remap itself is hardware-neutral.
+ * - LENS_VISIBLE_FLOOR_PCT gated on LENS_BRIDGE: 26 (gray, 3.3V calibration)
+ *   -> 7 (bridge, same ~1.7Vrms visibility threshold at 6.6V drive).
+ *   Bench-tune on the yellow cell.
+ *
  * CHANGELOG v4.15.6 (strobe-sync):
  * - App-paced breath+strobe. 0xB0 now takes an arg: 0xB0 0x01 enters
  *   LED_MODE_BREATHE_STROBE (standalone breathe+strobe), which shares the same
@@ -1576,7 +1595,13 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.15.6-strobe-sync"
+#define FIRMWARE_VERSION "4.16.0-yellow-bridge"
+
+/* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
+ * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
+ * 0 = direct-drive hardware (gray). Only the visibility floor differs;
+ * the drive_timer_cb pin mapping is correct for both. */
+#define LENS_BRIDGE 1
 static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
@@ -1762,12 +1787,21 @@ static const char *TAG = "SG_v4.14.39";
  ******************************************************************************/
 #define LCD_DEADZONE_RAW        400    /* LEGACY: pre-v4.14.12 floor, unused */
 #define PWM_MAX_RAW             1023   /* 10-bit LEDC resolution */
+#define PWM_FULL_RAW            1024   /* duty = 2^res: LEDC constant-high (no
+                                        * 1/1024 glitch). Bridge reference pin
+                                        * and brake state use this. */
 
-/* Low-end visibility floor (v4.15.4). Electrochromic tint isn't visible
- * until ~26% duty, so duty 1..100 is linearly remapped onto raw
- * [LENS_VISIBLE_FLOOR_RAW .. PWM_MAX_RAW]. Expressed as a percent so the
- * threshold stays readable; the compiler folds it to a constant (265). */
+/* Low-end visibility floor (v4.15.4; v4.16.0 gated on LENS_BRIDGE).
+ * Electrochromic tint isn't visible below a ~1.7Vrms threshold. Duty 1..100
+ * is linearly remapped onto raw [LENS_VISIBLE_FLOOR_RAW .. PWM_MAX_RAW].
+ * Direct drive (gray): threshold lands at ~26% duty at 3.3V.
+ * Bridge (yellow): cell RMS = 6.6V×sqrt(duty), so the same threshold lands
+ * at ~7% duty. Bench-tune per cell. */
+#if LENS_BRIDGE
+#define LENS_VISIBLE_FLOOR_PCT  7
+#else
 #define LENS_VISIBLE_FLOOR_PCT  26
+#endif
 #define LENS_VISIBLE_FLOOR_RAW  (LENS_VISIBLE_FLOOR_PCT * PWM_MAX_RAW / 100)
 
 static inline uint32_t duty_to_raw(uint8_t duty_percent) {
@@ -2844,13 +2878,21 @@ static bool IRAM_ATTR drive_timer_cb(gptimer_handle_t timer,
     }
 
     /* ── Apply PWM with AC phase ── */
+    /* v4.16.0: drive<->brake chop for the DRV8837 bridge (never coast).
+     * Reference pin solid high (PWM_FULL_RAW = true 100%, no 1/1024 glitch),
+     * other pin carries the duty complement:
+     *   both high            -> brake, 0V across cell (raw=0, true clear)
+     *   ref high + other low -> drive (fraction = duty)
+     * Cell RMS = Vdrive × sqrt(duty), actively pulled to 0V between drive
+     * slices — no coast-hold. Same differential waveform as the old mapping
+     * on direct-drive (gray) hardware. */
     uint32_t raw = duty_to_raw_isr(effective_duty);
     if (ac_phase == 0) {
-        pwm1_set_isr(raw);
-        pwm2_set_isr(1);
+        pwm1_set_isr(PWM_FULL_RAW);
+        pwm2_set_isr(PWM_FULL_RAW - raw);
     } else {
-        pwm1_set_isr(1);
-        pwm2_set_isr(raw);
+        pwm1_set_isr(PWM_FULL_RAW - raw);
+        pwm2_set_isr(PWM_FULL_RAW);
     }
 
     return false;  /* no task wake needed */

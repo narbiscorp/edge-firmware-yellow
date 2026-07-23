@@ -74,9 +74,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.info.outputs.tag }}
-          name: "Firmware ${{ steps.info.outputs.tag }}"
+          name: "Yellow Lens Firmware ${{ steps.info.outputs.tag }}"
           body: |
-            ## EDGE Firmware ${{ steps.info.outputs.tag }}
+            ## EDGE Firmware (YELLOW LENS / HV bridge build) ${{ steps.info.outputs.tag }}
 
             **Built:** ${{ steps.info.outputs.date }}
             **Size:** ${{ steps.info.outputs.size }} bytes
