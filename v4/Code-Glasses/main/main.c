@@ -109,6 +109,12 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.17.5 (yellow-dither tuned defaults) — YELLOW LENS BUILD:
+ * - Bench-tuned compiled defaults (fresh/factory-reset units): 120Hz carrier,
+ *   window min=5% max=20%, low γ=0.7, knee=command 60%, high γ=1.2. Units that
+ *   already saved values via 0xAE/0xAF keep them (NVS survives OTA); this only
+ *   changes the fallback for un-provisioned units.
+ *
  * CHANGELOG v4.17.4 (yellow-dither two-segment) — YELLOW LENS BUILD:
  * - Independent top-end curve shaping. 0xAE gains optional args 5-6:
  *   [gHi_x10][knee_cmd%]. The [min..max] window can now split at knee_cmd
@@ -1655,7 +1661,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.17.4-yellow-dither"
+#define FIRMWARE_VERSION "4.17.5-yellow-dither"
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
  * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
@@ -1816,7 +1822,7 @@ static const char *TAG = "SG_v4.14.39";
  * time Tf is slow, so at high freq the cell stays dark-biased and saturates
  * early); the cost is more visible flicker. Higher freq = smoother but the
  * spread compresses toward binary. */
-#define DITHER_DHZ_DEFAULT      500
+#define DITHER_DHZ_DEFAULT      1200  /* v4.17.5: 120Hz (bench-tuned) */
 #define DITHER_HZ_MIN           10
 #define DITHER_HZ_MAX           120
 /* v4.17.1: tint transfer curve. The responsive dither zone is narrow (~0..15%
@@ -1833,16 +1839,16 @@ static const char *TAG = "SG_v4.14.39";
  *   DITHER_MAX_PCT : on-fraction at command=100 (saturation knee)
  *   DITHER_GAMMA_X10: curve shape ×10 within the window (10=linear;
  *                     >10 stretches the low end, <10 the high end). */
-#define DITHER_MIN_PCT_DEFAULT   8
-#define DITHER_MAX_PCT_DEFAULT   22   /* v4.17.3: saturation knee (was 40) */
-#define DITHER_GAMMA_X10_DEFAULT 10   /* v4.17.3: LOW-segment gamma, linear */
+#define DITHER_MIN_PCT_DEFAULT   5    /* v4.17.5: bench-tuned (was 8) */
+#define DITHER_MAX_PCT_DEFAULT   20   /* v4.17.5: bench-tuned (was 22) */
+#define DITHER_GAMMA_X10_DEFAULT 7    /* v4.17.5: LOW-segment gamma 0.7 */
 /* v4.17.4: optional 2nd curve segment for independent top-end shaping. The
  * window [min..max] is split at DITHER_KNEE_CMD (command %); command 1..knee
  * uses the low gamma, knee..100 uses the HIGH gamma. Knee dither is pinned to
  * the linear window position at that command. knee>=100 (default) = one
  * segment (low gamma across the whole range) = unchanged v4.17.3 behavior. */
-#define DITHER_GHI_X10_DEFAULT   10   /* high-segment gamma (10=linear) */
-#define DITHER_KNEE_DEFAULT      100  /* split command %; 100 = single segment */
+#define DITHER_GHI_X10_DEFAULT   12   /* v4.17.5: high-segment gamma 1.2 */
+#define DITHER_KNEE_DEFAULT      60   /* v4.17.5: split at command 60% */
 #define DEFAULT_SESSION_MIN     30      /* 30 minute session (v4.14.17: was 10) */
 #define DEFAULT_BRIGHTNESS      100     /* 100% brightness */
 #define DEFAULT_STROBE_DHZ      100       /* 10Hz default strobe (deci-Hz) */
