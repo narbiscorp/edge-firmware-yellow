@@ -4409,8 +4409,10 @@ static void process_command(uint8_t *data, uint16_t len) {
             {
                 uint8_t mx = arg;
                 uint8_t gm = (len >= 3) ? data[2] : dither_gamma_x10;
-                if (mx < 5)  mx = 5;   if (mx > 100) mx = 100;
-                if (gm < 3)  gm = 3;   if (gm > 40)  gm = 40;
+                if (mx < 5)   mx = 5;
+                if (mx > 100) mx = 100;
+                if (gm < 3)   gm = 3;
+                if (gm > 40)  gm = 40;
                 dither_max_pct   = mx;
                 dither_gamma_x10 = gm;
                 dither_lut_build();
