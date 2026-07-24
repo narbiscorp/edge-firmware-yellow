@@ -109,6 +109,17 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.17.2 (yellow-dither spread) — YELLOW LENS BUILD:
+ * - Wider tint spread. The responsive dither zone is narrow (~0..15%) so tint
+ *   still saturated by command ~40. Two changes: (1) default gamma 1.0→2.0 so
+ *   the low/mid command range stretches (a given darkness now needs ~2× the
+ *   command — command 50 renders what command 25 did); 0xAE gamma ceiling
+ *   raised 4.0→8.0 for more. (2) New opcode 0xAF [Hz] makes the dither carrier
+ *   frequency live-tunable (10..120Hz, was fixed 50): LOWER freq lets the slow
+ *   cell track the switching more fully, widening the achievable spread (cost:
+ *   flicker), which no transfer curve can do since it changes what the cell can
+ *   physically reach, not just the mapping. Persisted (KEY_DITHER_HZ).
+ *
  * CHANGELOG v4.17.1 (yellow-dither curve) — YELLOW LENS BUILD:
  * - Tint transfer curve. With the flat dither map, perceived tint saturated
  *   by ~30% on-fraction (cell reaches full dark early; slow Tf keeps it there),
@@ -1626,7 +1637,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.17.1-yellow-dither"
+#define FIRMWARE_VERSION "4.17.2-yellow-dither"
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
  * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
@@ -1781,21 +1792,26 @@ static const char *TAG = "SG_v4.14.39";
 #define AC_HALF_TICKS           50      /* 50 × 100µs = 5ms = 100Hz AC */
 #define PHASE_FULL              100000U /* DDS wrap: 10000 ticks/sec × 10 for deci-Hz */
 /* v4.17.0: tint-dither carrier for the yellow bistable cell (LENS_BRIDGE).
- * deci-Hz, same DDS convention as strobe_dhz. 500 = 50.0Hz — the rate found
- * on the bench to integrate to smooth mid-tint without visible flicker.
- * Tunable: lower = deeper modulation but more flicker; higher = smoother but
- * the cell can't fully switch so depth compresses back toward binary. */
-#define DITHER_DHZ              500
-/* v4.17.1: tint transfer curve. The cell saturates to full-dark at a low
- * dither on-fraction (bench: ~30%), so dither above that is wasted range and
- * a linear command→dither map pins most of the breathe sine at full dark.
- * The command (0..100) is mapped through dither_lut[] into [0..DITHER_MAX_PCT]
- * on-fraction with a gamma. Both are live-tunable over BLE (0xAE) and saved.
- *   DITHER_MAX_PCT : on-fraction at command=100 (cap at the saturation knee)
- *   DITHER_GAMMA_X10: curve shape ×10 (10=linear; >10 stretches the low end,
- *                     <10 stretches the high end). */
+ * deci-Hz, same DDS convention as strobe_dhz. 500 = 50.0Hz. v4.17.2 makes it
+ * a runtime var (dither_dhz) tunable over BLE (0xAF). LOWER freq lets the cell
+ * track the switching more fully → wider, more linear tint spread (the clear
+ * time Tf is slow, so at high freq the cell stays dark-biased and saturates
+ * early); the cost is more visible flicker. Higher freq = smoother but the
+ * spread compresses toward binary. */
+#define DITHER_DHZ_DEFAULT      500
+#define DITHER_HZ_MIN           10
+#define DITHER_HZ_MAX           120
+/* v4.17.1: tint transfer curve. The responsive dither zone is narrow (~0..15%
+ * on-fraction) and steep, so a linear command→dither map saturates by command
+ * ~40 and pins the rest at full dark. Command (0..100) is mapped through
+ * dither_lut[] into [0..DITHER_MAX_PCT] on-fraction with a gamma. Live-tunable
+ * over BLE (0xAE) and saved.
+ *   DITHER_MAX_PCT : on-fraction at command=100 (cap near the saturation knee)
+ *   DITHER_GAMMA_X10: curve shape ×10 (10=linear; >10 stretches the low end so
+ *                     a given darkness needs more command — e.g. 20 puts old
+ *                     command-25's tint at command 50; <10 stretches the high). */
 #define DITHER_MAX_PCT_DEFAULT   40
-#define DITHER_GAMMA_X10_DEFAULT 10
+#define DITHER_GAMMA_X10_DEFAULT 20   /* v4.17.2: 2.0 (was 1.0 linear) */
 #define DEFAULT_SESSION_MIN     30      /* 30 minute session (v4.14.17: was 10) */
 #define DEFAULT_BRIGHTNESS      100     /* 100% brightness */
 #define DEFAULT_STROBE_DHZ      100       /* 10Hz default strobe (deci-Hz) */
@@ -2441,6 +2457,7 @@ static uint8_t adapt_resp_quintet(void) {
 #define KEY_STROBE_DUTY        "strob_dty"
 #define KEY_DITHER_MAX         "dith_max"    /* v4.17.1 yellow tint curve */
 #define KEY_DITHER_GAMMA       "dith_gam"
+#define KEY_DITHER_HZ          "dith_hz"     /* v4.17.2 dither freq (Hz) */
 #define KEY_BREATHE_BPM        "brth_bpm"
 #define KEY_BREATHE_INHALE     "brth_inh"
 #define KEY_BREATHE_HOLD_TOP   "brth_top"
@@ -2706,6 +2723,7 @@ static volatile uint8_t  dither_was_on = 0;
  * dither_lut_build() from dither_max_pct/dither_gamma_x10. ISR reads it. */
 static volatile uint8_t  dither_max_pct   = DITHER_MAX_PCT_DEFAULT;
 static volatile uint8_t  dither_gamma_x10 = DITHER_GAMMA_X10_DEFAULT;
+static volatile uint16_t dither_dhz       = DITHER_DHZ_DEFAULT;   /* deci-Hz, 0xAF */
 static volatile uint32_t dither_lut[101];
 
 static void dither_lut_build(void) {
@@ -2965,7 +2983,7 @@ static bool IRAM_ATTR drive_timer_cb(gptimer_handle_t timer,
      * into a stable intermediate optical density (see the state decl above).
      * raw is therefore always full-scale or zero — never an intermediate
      * amplitude, which this cell can't hold. */
-    dither_acc += DITHER_DHZ;
+    dither_acc += dither_dhz;
     if (dither_acc >= PHASE_FULL) dither_acc -= PHASE_FULL;
     uint8_t tint = effective_duty;
     if (tint > 100) tint = 100;
@@ -3271,9 +3289,11 @@ static void drive_timer_init(void) {
      * starts. Zero-init lut would render clear until built, so build first. */
     dither_max_pct   = prefs_get_u8(KEY_DITHER_MAX,   DITHER_MAX_PCT_DEFAULT);
     dither_gamma_x10 = prefs_get_u8(KEY_DITHER_GAMMA, DITHER_GAMMA_X10_DEFAULT);
+    dither_dhz       = (uint16_t)prefs_get_u8(KEY_DITHER_HZ,
+                                    DITHER_DHZ_DEFAULT / 10) * 10;
     dither_lut_build();
-    ESP_LOGI(TAG, "Yellow dither curve: max=%d%% gamma=%.1f",
-             dither_max_pct, dither_gamma_x10 / 10.0f);
+    ESP_LOGI(TAG, "Yellow dither: %uHz curve max=%d%% gamma=%.1f",
+             dither_dhz / 10, dither_max_pct, dither_gamma_x10 / 10.0f);
 #endif
     gptimer_config_t cfg = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
@@ -4287,6 +4307,7 @@ static void ota_task(void *param) {
  *   0xAC  STROBE: duty %                          (1 arg)
  *   0xAD  OTA   : page confirm/reject             (1 arg: 1=ok 0=resend)
  *   0xAE  LENS  : yellow dither curve [max%][γ×10] (2 arg; LENS_BRIDGE only)
+ *   0xAF  LENS  : yellow dither freq  [Hz 10..120]  (1 arg; LENS_BRIDGE only)
  *   0xB0  MODE  : enter BREATHE                   (0 arg)
  *   0xB1  BREATH: BPM                             (1 arg)
  *   0xB2  BREATH: inhale ratio %                  (1 arg)
@@ -4412,7 +4433,7 @@ static void process_command(uint8_t *data, uint16_t len) {
                 if (mx < 5)   mx = 5;
                 if (mx > 100) mx = 100;
                 if (gm < 3)   gm = 3;
-                if (gm > 40)  gm = 40;
+                if (gm > 80)  gm = 80;   /* v4.17.2: gamma up to 8.0 */
                 dither_max_pct   = mx;
                 dither_gamma_x10 = gm;
                 dither_lut_build();
@@ -4423,6 +4444,24 @@ static void process_command(uint8_t *data, uint16_t len) {
             }
 #else
             ESP_LOGW(TAG, "0xAE dither-curve ignored (not a LENS_BRIDGE build)");
+#endif
+            break;
+
+        case 0xAF:  /* v4.17.2 (LENS_BRIDGE): dither carrier frequency, Hz.
+                     *   [0xAF][hz]  (10..120). Lower = wider tint spread but
+                     * more flicker; higher = smoother but compresses spread.
+                     * Persisted. No-op on gray builds. */
+#if LENS_BRIDGE
+            {
+                uint8_t hz = arg;
+                if (hz < DITHER_HZ_MIN) hz = DITHER_HZ_MIN;
+                if (hz > DITHER_HZ_MAX) hz = DITHER_HZ_MAX;
+                dither_dhz = (uint16_t)hz * 10;
+                prefs_set_u8(KEY_DITHER_HZ, hz);
+                ESP_LOGI(TAG, "Yellow dither freq: %uHz (saved)", hz);
+            }
+#else
+            ESP_LOGW(TAG, "0xAF dither-freq ignored (not a LENS_BRIDGE build)");
 #endif
             break;
 
