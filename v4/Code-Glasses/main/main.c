@@ -109,6 +109,17 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.17.1 (yellow-dither curve) — YELLOW LENS BUILD:
+ * - Tint transfer curve. With the flat dither map, perceived tint saturated
+ *   by ~30% on-fraction (cell reaches full dark early; slow Tf keeps it there),
+ *   so dither 30-100% was wasted and the breathe sine pinned at full dark for
+ *   most of its arc ("on most of the time, brief fade"). Command (0..100) now
+ *   maps through dither_lut[] into [0..DITHER_MAX_PCT] on-fraction with a gamma,
+ *   so the full command range lands in the responsive zone. Live-tunable +
+ *   persisted via new opcode 0xAE [max_pct][gamma_x10] — bench-dial without an
+ *   OTA cycle. Defaults max=40%, gamma=1.0. LUT built at boot in
+ *   drive_timer_init from NVS (KEY_DITHER_MAX/KEY_DITHER_GAMMA).
+ *
  * CHANGELOG v4.17.0 (yellow-dither) — YELLOW LENS BUILD (LENS_BRIDGE=1):
  * - Temporal tint dither. v4.16.0's drive<->brake remap fixed clear/dark but
  *   tint was still BINARY: full clear <=57% duty, full dark >=58%. Cause is
@@ -1615,7 +1626,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.17.0-yellow-dither"
+#define FIRMWARE_VERSION "4.17.1-yellow-dither"
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
  * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
@@ -1775,6 +1786,16 @@ static const char *TAG = "SG_v4.14.39";
  * Tunable: lower = deeper modulation but more flicker; higher = smoother but
  * the cell can't fully switch so depth compresses back toward binary. */
 #define DITHER_DHZ              500
+/* v4.17.1: tint transfer curve. The cell saturates to full-dark at a low
+ * dither on-fraction (bench: ~30%), so dither above that is wasted range and
+ * a linear command→dither map pins most of the breathe sine at full dark.
+ * The command (0..100) is mapped through dither_lut[] into [0..DITHER_MAX_PCT]
+ * on-fraction with a gamma. Both are live-tunable over BLE (0xAE) and saved.
+ *   DITHER_MAX_PCT : on-fraction at command=100 (cap at the saturation knee)
+ *   DITHER_GAMMA_X10: curve shape ×10 (10=linear; >10 stretches the low end,
+ *                     <10 stretches the high end). */
+#define DITHER_MAX_PCT_DEFAULT   40
+#define DITHER_GAMMA_X10_DEFAULT 10
 #define DEFAULT_SESSION_MIN     30      /* 30 minute session (v4.14.17: was 10) */
 #define DEFAULT_BRIGHTNESS      100     /* 100% brightness */
 #define DEFAULT_STROBE_DHZ      100       /* 10Hz default strobe (deci-Hz) */
@@ -2418,6 +2439,8 @@ static uint8_t adapt_resp_quintet(void) {
 #define KEY_SESSION_MIN        "sess_min"
 #define KEY_STROBE_DHZ         "strob_dhz"
 #define KEY_STROBE_DUTY        "strob_dty"
+#define KEY_DITHER_MAX         "dith_max"    /* v4.17.1 yellow tint curve */
+#define KEY_DITHER_GAMMA       "dith_gam"
 #define KEY_BREATHE_BPM        "brth_bpm"
 #define KEY_BREATHE_INHALE     "brth_inh"
 #define KEY_BREATHE_HOLD_TOP   "brth_top"
@@ -2679,6 +2702,23 @@ static volatile uint8_t ac_reset_polarity = 0;
  * passes through unchanged — 100% dither = always on, 0% = always off. */
 static volatile uint32_t dither_acc = 0;   /* DDS phase accumulator */
 static volatile uint8_t  dither_was_on = 0;
+/* Command(0..100) → dither on-threshold (0..PHASE_FULL). Rebuilt by
+ * dither_lut_build() from dither_max_pct/dither_gamma_x10. ISR reads it. */
+static volatile uint8_t  dither_max_pct   = DITHER_MAX_PCT_DEFAULT;
+static volatile uint8_t  dither_gamma_x10 = DITHER_GAMMA_X10_DEFAULT;
+static volatile uint32_t dither_lut[101];
+
+static void dither_lut_build(void) {
+    float g = dither_gamma_x10 / 10.0f;
+    if (g < 0.1f) g = 0.1f;
+    uint32_t span = (uint32_t)((PHASE_FULL / 100.0f) * (float)dither_max_pct);
+    for (int c = 0; c <= 100; c++) {
+        float frac = powf((float)c / 100.0f, g);   /* 0..1 shaped by gamma */
+        dither_lut[c] = (uint32_t)(frac * (float)span);
+    }
+    dither_lut[0]   = 0;       /* command 0  → never on  → true clear */
+    dither_lut[100] = span;    /* command 100 → cap on-fraction (full dark) */
+}
 #endif
 
 /* OTA state */
@@ -2929,7 +2969,10 @@ static bool IRAM_ATTR drive_timer_cb(gptimer_handle_t timer,
     if (dither_acc >= PHASE_FULL) dither_acc -= PHASE_FULL;
     uint8_t tint = effective_duty;
     if (tint > 100) tint = 100;
-    uint8_t is_on = (dither_acc < (uint32_t)tint * (PHASE_FULL / 100)) ? 1 : 0;
+    /* Map command → dither on-fraction through the transfer LUT (compensates
+     * the cell's steep-then-flat optical response so the command range spreads
+     * across the usable tint range). */
+    uint8_t is_on = (dither_acc < dither_lut[tint]) ? 1 : 0;
 
     /* DC balance: alternate AC start polarity at each off→on edge so every
      * on-burst pairs with an opposite-polarity neighbour (mirrors the strobe
@@ -3223,6 +3266,15 @@ static void ppg_auto_check(void) {
 #endif /* !PPG_TEST_BUILD */
 
 static void drive_timer_init(void) {
+#if LENS_BRIDGE
+    /* Load the tint transfer curve from NVS and build the LUT before the ISR
+     * starts. Zero-init lut would render clear until built, so build first. */
+    dither_max_pct   = prefs_get_u8(KEY_DITHER_MAX,   DITHER_MAX_PCT_DEFAULT);
+    dither_gamma_x10 = prefs_get_u8(KEY_DITHER_GAMMA, DITHER_GAMMA_X10_DEFAULT);
+    dither_lut_build();
+    ESP_LOGI(TAG, "Yellow dither curve: max=%d%% gamma=%.1f",
+             dither_max_pct, dither_gamma_x10 / 10.0f);
+#endif
     gptimer_config_t cfg = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
@@ -4234,6 +4286,7 @@ static void ota_task(void *param) {
  *   0xAB  STROBE: frequency Hz                    (1 arg)
  *   0xAC  STROBE: duty %                          (1 arg)
  *   0xAD  OTA   : page confirm/reject             (1 arg: 1=ok 0=resend)
+ *   0xAE  LENS  : yellow dither curve [max%][γ×10] (2 arg; LENS_BRIDGE only)
  *   0xB0  MODE  : enter BREATHE                   (0 arg)
  *   0xB1  BREATH: BPM                             (1 arg)
  *   0xB2  BREATH: inhale ratio %                  (1 arg)
@@ -4347,7 +4400,30 @@ static void process_command(uint8_t *data, uint16_t len) {
             prefs_set_u8(KEY_STROBE_DUTY, arg);
             ESP_LOGI(TAG, "Strobe duty: %d%%", strobe_duty_pct);
             break;
-            
+
+        case 0xAE:  /* v4.17.1 (LENS_BRIDGE): tune yellow tint transfer curve.
+                     *   [0xAE][max_pct][gamma_x10]  (gamma optional, keeps prev)
+                     * Rebuilds dither_lut live and persists — bench-tunable
+                     * without an OTA cycle. No-op on gray builds. */
+#if LENS_BRIDGE
+            {
+                uint8_t mx = arg;
+                uint8_t gm = (len >= 3) ? data[2] : dither_gamma_x10;
+                if (mx < 5)  mx = 5;   if (mx > 100) mx = 100;
+                if (gm < 3)  gm = 3;   if (gm > 40)  gm = 40;
+                dither_max_pct   = mx;
+                dither_gamma_x10 = gm;
+                dither_lut_build();
+                prefs_set_u8(KEY_DITHER_MAX,   mx);
+                prefs_set_u8(KEY_DITHER_GAMMA, gm);
+                ESP_LOGI(TAG, "Yellow dither curve: max=%d%% gamma=%.1f (saved)",
+                         mx, gm / 10.0f);
+            }
+#else
+            ESP_LOGW(TAG, "0xAE dither-curve ignored (not a LENS_BRIDGE build)");
+#endif
+            break;
+
         /* ── OTA ───────────────────────────────────────────── */
         case 0xA8:  /* Start OTA (deferred to OTA task).
                      * Optional payload [0xA8][size LE32]: the host's image size,
