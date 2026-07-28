@@ -109,6 +109,16 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.17.7 (yellow-dither inhale/exhale) — YELLOW LENS BUILD:
+ * - Separate exhale transfer curve. The cell tints fast but clears slow, so one
+ *   command→darkness map holds tint on the falling half of the breath. A 2nd
+ *   full curve (dither_lut_ex) is now selected by led_task while the breathe
+ *   command is falling (exhale + hold-bottom), when enabled. 0xAE gains arg 8
+ *   [target] (0=inhale/default, 1=exhale); new 0xBB [0|1] toggles the split.
+ *   Exhale params default to the inhale curve and persist (KEY_DITHER_EX_*,
+ *   KEY_DITHER_SPLIT). Off = unchanged single-curve behavior; only LED_MODE_BREATHE
+ *   uses the exhale curve (static/strobe/coherence keep the main curve).
+ *
  * CHANGELOG v4.17.6 (yellow-dither knee level) — YELLOW LENS BUILD:
  * - Explicit knee dither level. 0xAE gains optional arg 7 [knee_lvl%]: the
  *   dither on-fraction AT the knee command, clamped to [min..max]. 0 = auto
@@ -1670,7 +1680,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.17.6-yellow-dither"
+#define FIRMWARE_VERSION "4.17.7-yellow-dither"
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
  * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
@@ -2514,6 +2524,13 @@ static uint8_t adapt_resp_quintet(void) {
 #define KEY_DITHER_GHI         "dith_ghi"    /* v4.17.4 high-segment gamma */
 #define KEY_DITHER_KNEE        "dith_knee"   /* v4.17.4 segment split command */
 #define KEY_DITHER_KPCT        "dith_kpct"   /* v4.17.6 knee dither level % */
+#define KEY_DITHER_SPLIT       "dith_split"  /* v4.17.7 separate exhale curve on/off */
+#define KEY_DITHER_EX_MIN      "dith_xmin"
+#define KEY_DITHER_EX_MAX      "dith_xmax"
+#define KEY_DITHER_EX_GLO      "dith_xglo"
+#define KEY_DITHER_EX_GHI      "dith_xghi"
+#define KEY_DITHER_EX_KNEE     "dith_xknee"
+#define KEY_DITHER_EX_KPCT     "dith_xkpct"
 #define KEY_BREATHE_BPM        "brth_bpm"
 #define KEY_BREATHE_INHALE     "brth_inh"
 #define KEY_BREATHE_HOLD_TOP   "brth_top"
@@ -2783,36 +2800,41 @@ static volatile uint8_t  dither_gamma_x10 = DITHER_GAMMA_X10_DEFAULT;  /* LOW se
 static volatile uint8_t  dither_ghi_x10   = DITHER_GHI_X10_DEFAULT;    /* HIGH seg */
 static volatile uint8_t  dither_knee_cmd  = DITHER_KNEE_DEFAULT;       /* split cmd% */
 static volatile uint8_t  dither_knee_pct  = DITHER_KNEE_PCT_DEFAULT;   /* knee level% (0=auto) */
+/* v4.17.7: independent EXHALE curve. The cell tints fast but clears slow, so a
+ * single command→darkness map holds tint on the falling (exhale) half. These
+ * mirror the inhale params and default to them; led_task selects this LUT while
+ * the breathe command is falling, when dither_split is on. */
+static volatile uint8_t  dither_ex_min    = DITHER_MIN_PCT_DEFAULT;
+static volatile uint8_t  dither_ex_max    = DITHER_MAX_PCT_DEFAULT;
+static volatile uint8_t  dither_ex_glo    = DITHER_GAMMA_X10_DEFAULT;
+static volatile uint8_t  dither_ex_ghi    = DITHER_GHI_X10_DEFAULT;
+static volatile uint8_t  dither_ex_knee   = DITHER_KNEE_DEFAULT;
+static volatile uint8_t  dither_ex_kpct   = DITHER_KNEE_PCT_DEFAULT;
+static volatile uint8_t  dither_split      = 0;  /* 0 = one curve for both halves */
+static volatile uint8_t  dither_dir_exhale = 0;  /* set by led_task: 1 while exhaling */
 static volatile uint16_t dither_dhz       = DITHER_DHZ_DEFAULT;   /* deci-Hz, 0xAF */
-static volatile uint32_t dither_lut[101];
+static volatile uint32_t dither_lut[101];      /* inhale / default (all non-breathe modes) */
+static volatile uint32_t dither_lut_ex[101];   /* exhale (falling breathe command) */
 
-static void dither_lut_build(void) {
-    float gLo = dither_gamma_x10 / 10.0f;
-    float gHi = dither_ghi_x10   / 10.0f;
+static void dither_build_one(volatile uint32_t *lut, uint8_t mnP, uint8_t mxP,
+                             uint8_t gloX, uint8_t ghiX, uint8_t kcP, uint8_t kpP) {
+    float gLo = gloX / 10.0f, gHi = ghiX / 10.0f;
     if (gLo < 0.1f) gLo = 0.1f;
     if (gHi < 0.1f) gHi = 0.1f;
-    uint32_t lo = (uint32_t)((PHASE_FULL / 100.0f) * (float)dither_min_pct);
-    uint32_t hi = (uint32_t)((PHASE_FULL / 100.0f) * (float)dither_max_pct);
+    uint32_t lo = (uint32_t)((PHASE_FULL / 100.0f) * (float)mnP);
+    uint32_t hi = (uint32_t)((PHASE_FULL / 100.0f) * (float)mxP);
     if (hi < lo) hi = lo;
-    uint8_t kc = dither_knee_cmd;
-    dither_lut[0] = 0;         /* command 0 → never on → true clear */
-    if (kc < 2 || kc >= 100) {
-        /* Single segment: low gamma across the whole [lo..hi] window.
-         * command 1 = the tint threshold (visible floor) so every step moves. */
+    lut[0] = 0;               /* command 0 → never on → true clear */
+    if (kcP < 2 || kcP >= 100) {
         for (int c = 1; c <= 100; c++) {
-            float t = (float)(c - 1) / 99.0f;       /* 0 at c=1, 1 at c=100 */
-            dither_lut[c] = lo + (uint32_t)(powf(t, gLo) * (float)(hi - lo));
+            float t = (float)(c - 1) / 99.0f;
+            lut[c] = lo + (uint32_t)(powf(t, gLo) * (float)(hi - lo));
         }
     } else {
-        /* Two segments joined at the knee (command kc): command 1..kc shaped by
-         * gLo over [lo..knee], kc..100 shaped by gHi over [knee..hi]. The knee
-         * dither is either explicit (dither_knee_pct>0, clamped to [lo..hi]) or
-         * auto-pinned to the linear window position. A low explicit knee lets
-         * the top segment span a wide visible band so it clears progressively. */
-        float tk = (float)(kc - 1) / 99.0f;
+        float tk = (float)(kcP - 1) / 99.0f;
         uint32_t knee;
-        if (dither_knee_pct > 0) {
-            knee = (uint32_t)((PHASE_FULL / 100.0f) * (float)dither_knee_pct);
+        if (kpP > 0) {
+            knee = (uint32_t)((PHASE_FULL / 100.0f) * (float)kpP);
             if (knee < lo) knee = lo;
             if (knee > hi) knee = hi;
         } else {
@@ -2820,16 +2842,17 @@ static void dither_lut_build(void) {
         }
         for (int c = 1; c <= 100; c++) {
             float t = (float)(c - 1) / 99.0f;
-            if (c <= kc) {
-                float u = (tk > 0.0f) ? (t / tk) : 0.0f;
-                dither_lut[c] = lo + (uint32_t)(powf(u, gLo) * (float)(knee - lo));
-            } else {
-                float u = (t - tk) / (1.0f - tk);
-                dither_lut[c] = knee + (uint32_t)(powf(u, gHi) * (float)(hi - knee));
-            }
+            if (c <= kcP) { float u = (tk > 0.0f) ? (t / tk) : 0.0f; lut[c] = lo + (uint32_t)(powf(u, gLo) * (float)(knee - lo)); }
+            else { float u = (t - tk) / (1.0f - tk); lut[c] = knee + (uint32_t)(powf(u, gHi) * (float)(hi - knee)); }
         }
     }
-    dither_lut[100] = hi;      /* command 100 → saturation */
+    lut[100] = hi;            /* command 100 → saturation */
+}
+static void dither_lut_build(void) {
+    dither_build_one(dither_lut, dither_min_pct, dither_max_pct, dither_gamma_x10,
+                     dither_ghi_x10, dither_knee_cmd, dither_knee_pct);
+    dither_build_one(dither_lut_ex, dither_ex_min, dither_ex_max, dither_ex_glo,
+                     dither_ex_ghi, dither_ex_knee, dither_ex_kpct);
 }
 #endif
 
@@ -3082,9 +3105,13 @@ static bool IRAM_ATTR drive_timer_cb(gptimer_handle_t timer,
     uint8_t tint = effective_duty;
     if (tint > 100) tint = 100;
     /* Map command → dither on-fraction through the transfer LUT (compensates
-     * the cell's steep-then-flat optical response so the command range spreads
-     * across the usable tint range). */
-    uint8_t is_on = (dither_acc < dither_lut[tint]) ? 1 : 0;
+     * the cell's steep-then-flat optical response). v4.17.7: while breathing
+     * with a separate exhale curve enabled, the falling half uses dither_lut_ex
+     * (the cell clears slower than it tints, so the exhale needs its own map). */
+    const volatile uint32_t *lut =
+        (dither_split && dither_dir_exhale && led_mode == LED_MODE_BREATHE)
+        ? dither_lut_ex : dither_lut;
+    uint8_t is_on = (dither_acc < lut[tint]) ? 1 : 0;
 
     /* DC balance: alternate AC start polarity at each off→on edge so every
      * on-burst pairs with an opposite-polarity neighbour (mirrors the strobe
@@ -3387,13 +3414,20 @@ static void drive_timer_init(void) {
     dither_ghi_x10   = prefs_get_u8(KEY_DITHER_GHI,   DITHER_GHI_X10_DEFAULT);
     dither_knee_cmd  = prefs_get_u8(KEY_DITHER_KNEE,  DITHER_KNEE_DEFAULT);
     dither_knee_pct  = prefs_get_u8(KEY_DITHER_KPCT,  DITHER_KNEE_PCT_DEFAULT);
+    dither_split     = prefs_get_u8(KEY_DITHER_SPLIT, 0);
+    dither_ex_min    = prefs_get_u8(KEY_DITHER_EX_MIN,  dither_min_pct);
+    dither_ex_max    = prefs_get_u8(KEY_DITHER_EX_MAX,  dither_max_pct);
+    dither_ex_glo    = prefs_get_u8(KEY_DITHER_EX_GLO,  dither_gamma_x10);
+    dither_ex_ghi    = prefs_get_u8(KEY_DITHER_EX_GHI,  dither_ghi_x10);
+    dither_ex_knee   = prefs_get_u8(KEY_DITHER_EX_KNEE, dither_knee_cmd);
+    dither_ex_kpct   = prefs_get_u8(KEY_DITHER_EX_KPCT, dither_knee_pct);
     dither_dhz       = (uint16_t)prefs_get_u8(KEY_DITHER_HZ,
                                     DITHER_DHZ_DEFAULT / 10) * 10;
     dither_lut_build();
-    ESP_LOGI(TAG, "Yellow dither: %uHz window %d-%d%% gLo=%.1f gHi=%.1f knee=%d@%d",
+    ESP_LOGI(TAG, "Yellow dither: %uHz window %d-%d%% gLo=%.1f gHi=%.1f knee=%d@%d split=%d",
              dither_dhz / 10, dither_min_pct, dither_max_pct,
              dither_gamma_x10 / 10.0f, dither_ghi_x10 / 10.0f,
-             dither_knee_cmd, dither_knee_pct);
+             dither_knee_cmd, dither_knee_pct, dither_split);
 #endif
     gptimer_config_t cfg = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
@@ -3811,6 +3845,13 @@ static void led_task(void *param) {
                     : 1.0f - p;
             }
             /* else: hold at bottom, frac = 0 */
+
+            /* v4.17.7: tell the dither ISR which half we're in — inhale (rising,
+             * incl. hold-top) uses the main curve, exhale (falling, incl.
+             * hold-bottom) uses dither_lut_ex when dither_split is on. */
+#if LENS_BRIDGE
+            dither_dir_exhale = (t >= inhale_ms + hold_top_ms) ? 1 : 0;
+#endif
 
             /* Publish for ISR (BREATHE_STROBE scales dark duty by this). */
             breathe_frac_q8 = (uint8_t)(frac * 255.0f);
@@ -4406,7 +4447,9 @@ static void ota_task(void *param) {
  *   0xAB  STROBE: frequency Hz                    (1 arg)
  *   0xAC  STROBE: duty %                          (1 arg)
  *   0xAD  OTA   : page confirm/reject             (1 arg: 1=ok 0=resend)
- *   0xAE  LENS  : dither curve [max%][γLo×10][min%][γHi×10][knee_cmd%][knee_lvl%]
+ *   0xAE  LENS  : dither curve [max%][γLo×10][min%][γHi×10][knee_cmd%][knee_lvl%][target]
+ *                 target: 0=inhale/default, 1=exhale (v4.17.7)
+ *   0xBB  LENS  : separate exhale curve on/off [0|1]  (v4.17.7, LENS_BRIDGE)
  *   0xAF  LENS  : yellow dither freq  [Hz 10..120]  (1 arg; LENS_BRIDGE only)
  *   0xB0  MODE  : enter BREATHE                   (0 arg)
  *   0xB1  BREATH: BPM                             (1 arg)
@@ -4536,6 +4579,7 @@ static void process_command(uint8_t *data, uint16_t len) {
                 uint8_t gh = (len >= 5) ? data[4] : dither_ghi_x10;
                 uint8_t kc = (len >= 6) ? data[5] : dither_knee_cmd;
                 uint8_t kp = (len >= 7) ? data[6] : dither_knee_pct;
+                uint8_t tgt = (len >= 8) ? data[7] : 0;   /* 0=inhale/default, 1=exhale */
                 if (mx < 5)   mx = 5;
                 if (mx > 100) mx = 100;
                 if (gm < 3)   gm = 3;
@@ -4546,21 +4590,22 @@ static void process_command(uint8_t *data, uint16_t len) {
                 if (kp > 100) kp = 100;  /* 0 = auto-pin knee level */
                 if (mn > 50)  mn = 50;   /* floor cap */
                 if (mn >= mx) mn = (mx > 1) ? (mx - 1) : 0;
-                dither_min_pct   = mn;
-                dither_max_pct   = mx;
-                dither_gamma_x10 = gm;
-                dither_ghi_x10   = gh;
-                dither_knee_cmd  = kc;
-                dither_knee_pct  = kp;
-                prefs_set_u8(KEY_DITHER_MIN,   mn);
-                prefs_set_u8(KEY_DITHER_MAX,   mx);
-                prefs_set_u8(KEY_DITHER_GAMMA, gm);
-                prefs_set_u8(KEY_DITHER_GHI,   gh);
-                prefs_set_u8(KEY_DITHER_KNEE,  kc);
-                prefs_set_u8(KEY_DITHER_KPCT,  kp);
+                if (tgt == 1) {          /* v4.17.7: EXHALE curve */
+                    dither_ex_min = mn; dither_ex_max = mx; dither_ex_glo = gm;
+                    dither_ex_ghi = gh; dither_ex_knee = kc; dither_ex_kpct = kp;
+                    prefs_set_u8(KEY_DITHER_EX_MIN, mn); prefs_set_u8(KEY_DITHER_EX_MAX, mx);
+                    prefs_set_u8(KEY_DITHER_EX_GLO, gm); prefs_set_u8(KEY_DITHER_EX_GHI, gh);
+                    prefs_set_u8(KEY_DITHER_EX_KNEE, kc); prefs_set_u8(KEY_DITHER_EX_KPCT, kp);
+                } else {                 /* inhale / shared default */
+                    dither_min_pct = mn; dither_max_pct = mx; dither_gamma_x10 = gm;
+                    dither_ghi_x10 = gh; dither_knee_cmd = kc; dither_knee_pct = kp;
+                    prefs_set_u8(KEY_DITHER_MIN, mn); prefs_set_u8(KEY_DITHER_MAX, mx);
+                    prefs_set_u8(KEY_DITHER_GAMMA, gm); prefs_set_u8(KEY_DITHER_GHI, gh);
+                    prefs_set_u8(KEY_DITHER_KNEE, kc); prefs_set_u8(KEY_DITHER_KPCT, kp);
+                }
                 dither_lut_build();
-                ESP_LOGI(TAG, "Yellow dither: window %d-%d%% gLo=%.1f gHi=%.1f knee=%d@%d (saved)",
-                         mn, mx, gm / 10.0f, gh / 10.0f, kc, kp);
+                ESP_LOGI(TAG, "Yellow dither[%s]: window %d-%d%% gLo=%.1f gHi=%.1f knee=%d@%d (saved)",
+                         tgt == 1 ? "exhale" : "inhale", mn, mx, gm / 10.0f, gh / 10.0f, kc, kp);
             }
 #else
             ESP_LOGW(TAG, "0xAE dither-curve ignored (not a LENS_BRIDGE build)");
@@ -4582,6 +4627,19 @@ static void process_command(uint8_t *data, uint16_t len) {
             }
 #else
             ESP_LOGW(TAG, "0xAF dither-freq ignored (not a LENS_BRIDGE build)");
+#endif
+            break;
+
+        case 0xBB:  /* v4.17.7 (LENS_BRIDGE): separate exhale curve on/off.
+                     *   [0xBB][enable 0/1]. When on, the falling half of the
+                     * breath uses the exhale curve (0xAE target 1). Persisted. */
+#if LENS_BRIDGE
+            dither_split = arg ? 1 : 0;
+            prefs_set_u8(KEY_DITHER_SPLIT, dither_split);
+            ESP_LOGI(TAG, "Yellow dither split (exhale curve): %s",
+                     dither_split ? "ON" : "OFF");
+#else
+            ESP_LOGW(TAG, "0xBB dither-split ignored (not a LENS_BRIDGE build)");
 #endif
             break;
 
