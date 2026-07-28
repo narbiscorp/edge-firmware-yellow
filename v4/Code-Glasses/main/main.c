@@ -109,6 +109,15 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.17.6 (yellow-dither knee level) — YELLOW LENS BUILD:
+ * - Explicit knee dither level. 0xAE gains optional arg 7 [knee_lvl%]: the
+ *   dither on-fraction AT the knee command, clamped to [min..max]. 0 = auto
+ *   (linear-pinned, = v4.17.5). A LOW explicit knee level makes the top segment
+ *   (knee..100) span a wide visible band, so the top clears progressively on
+ *   the exhale instead of holding a saturated plateau (fixes "top holds tint
+ *   too long"). New KEY_DITHER_KPCT. (Controller also lowers the knee-command
+ *   floor below 50%.)
+ *
  * CHANGELOG v4.17.5 (yellow-dither tuned defaults) — YELLOW LENS BUILD:
  * - Bench-tuned compiled defaults (fresh/factory-reset units): 120Hz carrier,
  *   window min=5% max=20%, low γ=0.7, knee=command 60%, high γ=1.2. Units that
@@ -1661,7 +1670,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.17.5-yellow-dither"
+#define FIRMWARE_VERSION "4.17.6-yellow-dither"
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
  * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
@@ -1849,6 +1858,12 @@ static const char *TAG = "SG_v4.14.39";
  * segment (low gamma across the whole range) = unchanged v4.17.3 behavior. */
 #define DITHER_GHI_X10_DEFAULT   12   /* v4.17.5: high-segment gamma 1.2 */
 #define DITHER_KNEE_DEFAULT      60   /* v4.17.5: split at command 60% */
+/* v4.17.6: knee dither level %. 0 = auto (pin to the linear window position,
+ * = v4.17.5 behavior). >0 sets the dither on-fraction AT the knee command
+ * explicitly (clamped to [min..max]), so the top segment (knee..100) can span
+ * a wide visible band even for a high knee — lets the top clear progressively
+ * on the exhale instead of holding a saturated plateau. */
+#define DITHER_KNEE_PCT_DEFAULT  0
 #define DEFAULT_SESSION_MIN     30      /* 30 minute session (v4.14.17: was 10) */
 #define DEFAULT_BRIGHTNESS      100     /* 100% brightness */
 #define DEFAULT_STROBE_DHZ      100       /* 10Hz default strobe (deci-Hz) */
@@ -2498,6 +2513,7 @@ static uint8_t adapt_resp_quintet(void) {
 #define KEY_DITHER_MIN         "dith_min"    /* v4.17.3 tint-threshold floor */
 #define KEY_DITHER_GHI         "dith_ghi"    /* v4.17.4 high-segment gamma */
 #define KEY_DITHER_KNEE        "dith_knee"   /* v4.17.4 segment split command */
+#define KEY_DITHER_KPCT        "dith_kpct"   /* v4.17.6 knee dither level % */
 #define KEY_BREATHE_BPM        "brth_bpm"
 #define KEY_BREATHE_INHALE     "brth_inh"
 #define KEY_BREATHE_HOLD_TOP   "brth_top"
@@ -2766,6 +2782,7 @@ static volatile uint8_t  dither_max_pct   = DITHER_MAX_PCT_DEFAULT;
 static volatile uint8_t  dither_gamma_x10 = DITHER_GAMMA_X10_DEFAULT;  /* LOW seg */
 static volatile uint8_t  dither_ghi_x10   = DITHER_GHI_X10_DEFAULT;    /* HIGH seg */
 static volatile uint8_t  dither_knee_cmd  = DITHER_KNEE_DEFAULT;       /* split cmd% */
+static volatile uint8_t  dither_knee_pct  = DITHER_KNEE_PCT_DEFAULT;   /* knee level% (0=auto) */
 static volatile uint16_t dither_dhz       = DITHER_DHZ_DEFAULT;   /* deci-Hz, 0xAF */
 static volatile uint32_t dither_lut[101];
 
@@ -2787,12 +2804,20 @@ static void dither_lut_build(void) {
             dither_lut[c] = lo + (uint32_t)(powf(t, gLo) * (float)(hi - lo));
         }
     } else {
-        /* Two segments joined at the knee (command kc, dither pinned to the
-         * linear window position there): command 1..kc shaped by gLo over
-         * [lo..knee], kc..100 shaped by gHi over [knee..hi]. Independent
-         * top-end shaping without disturbing the low end. */
+        /* Two segments joined at the knee (command kc): command 1..kc shaped by
+         * gLo over [lo..knee], kc..100 shaped by gHi over [knee..hi]. The knee
+         * dither is either explicit (dither_knee_pct>0, clamped to [lo..hi]) or
+         * auto-pinned to the linear window position. A low explicit knee lets
+         * the top segment span a wide visible band so it clears progressively. */
         float tk = (float)(kc - 1) / 99.0f;
-        uint32_t knee = lo + (uint32_t)(tk * (float)(hi - lo));
+        uint32_t knee;
+        if (dither_knee_pct > 0) {
+            knee = (uint32_t)((PHASE_FULL / 100.0f) * (float)dither_knee_pct);
+            if (knee < lo) knee = lo;
+            if (knee > hi) knee = hi;
+        } else {
+            knee = lo + (uint32_t)(tk * (float)(hi - lo));
+        }
         for (int c = 1; c <= 100; c++) {
             float t = (float)(c - 1) / 99.0f;
             if (c <= kc) {
@@ -3361,12 +3386,14 @@ static void drive_timer_init(void) {
     dither_gamma_x10 = prefs_get_u8(KEY_DITHER_GAMMA, DITHER_GAMMA_X10_DEFAULT);
     dither_ghi_x10   = prefs_get_u8(KEY_DITHER_GHI,   DITHER_GHI_X10_DEFAULT);
     dither_knee_cmd  = prefs_get_u8(KEY_DITHER_KNEE,  DITHER_KNEE_DEFAULT);
+    dither_knee_pct  = prefs_get_u8(KEY_DITHER_KPCT,  DITHER_KNEE_PCT_DEFAULT);
     dither_dhz       = (uint16_t)prefs_get_u8(KEY_DITHER_HZ,
                                     DITHER_DHZ_DEFAULT / 10) * 10;
     dither_lut_build();
-    ESP_LOGI(TAG, "Yellow dither: %uHz window %d-%d%% gLo=%.1f gHi=%.1f knee=%d",
+    ESP_LOGI(TAG, "Yellow dither: %uHz window %d-%d%% gLo=%.1f gHi=%.1f knee=%d@%d",
              dither_dhz / 10, dither_min_pct, dither_max_pct,
-             dither_gamma_x10 / 10.0f, dither_ghi_x10 / 10.0f, dither_knee_cmd);
+             dither_gamma_x10 / 10.0f, dither_ghi_x10 / 10.0f,
+             dither_knee_cmd, dither_knee_pct);
 #endif
     gptimer_config_t cfg = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
@@ -4379,7 +4406,7 @@ static void ota_task(void *param) {
  *   0xAB  STROBE: frequency Hz                    (1 arg)
  *   0xAC  STROBE: duty %                          (1 arg)
  *   0xAD  OTA   : page confirm/reject             (1 arg: 1=ok 0=resend)
- *   0xAE  LENS  : yellow dither curve [max%][γLo×10][min%][γHi×10][knee%]
+ *   0xAE  LENS  : dither curve [max%][γLo×10][min%][γHi×10][knee_cmd%][knee_lvl%]
  *   0xAF  LENS  : yellow dither freq  [Hz 10..120]  (1 arg; LENS_BRIDGE only)
  *   0xB0  MODE  : enter BREATHE                   (0 arg)
  *   0xB1  BREATH: BPM                             (1 arg)
@@ -4508,6 +4535,7 @@ static void process_command(uint8_t *data, uint16_t len) {
                 uint8_t mn = (len >= 4) ? data[3] : dither_min_pct;
                 uint8_t gh = (len >= 5) ? data[4] : dither_ghi_x10;
                 uint8_t kc = (len >= 6) ? data[5] : dither_knee_cmd;
+                uint8_t kp = (len >= 7) ? data[6] : dither_knee_pct;
                 if (mx < 5)   mx = 5;
                 if (mx > 100) mx = 100;
                 if (gm < 3)   gm = 3;
@@ -4515,6 +4543,7 @@ static void process_command(uint8_t *data, uint16_t len) {
                 if (gh < 3)   gh = 3;
                 if (gh > 80)  gh = 80;
                 if (kc > 100) kc = 100;
+                if (kp > 100) kp = 100;  /* 0 = auto-pin knee level */
                 if (mn > 50)  mn = 50;   /* floor cap */
                 if (mn >= mx) mn = (mx > 1) ? (mx - 1) : 0;
                 dither_min_pct   = mn;
@@ -4522,14 +4551,16 @@ static void process_command(uint8_t *data, uint16_t len) {
                 dither_gamma_x10 = gm;
                 dither_ghi_x10   = gh;
                 dither_knee_cmd  = kc;
+                dither_knee_pct  = kp;
                 prefs_set_u8(KEY_DITHER_MIN,   mn);
                 prefs_set_u8(KEY_DITHER_MAX,   mx);
                 prefs_set_u8(KEY_DITHER_GAMMA, gm);
                 prefs_set_u8(KEY_DITHER_GHI,   gh);
                 prefs_set_u8(KEY_DITHER_KNEE,  kc);
+                prefs_set_u8(KEY_DITHER_KPCT,  kp);
                 dither_lut_build();
-                ESP_LOGI(TAG, "Yellow dither: window %d-%d%% gLo=%.1f gHi=%.1f knee=%d (saved)",
-                         mn, mx, gm / 10.0f, gh / 10.0f, kc);
+                ESP_LOGI(TAG, "Yellow dither: window %d-%d%% gLo=%.1f gHi=%.1f knee=%d@%d (saved)",
+                         mn, mx, gm / 10.0f, gh / 10.0f, kc, kp);
             }
 #else
             ESP_LOGW(TAG, "0xAE dither-curve ignored (not a LENS_BRIDGE build)");
