@@ -109,6 +109,13 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.17.9 (yellow self-identify) — YELLOW LENS BUILD:
+ * - Added a standard Device Information Service (0x180A) with Firmware Revision
+ *   String (0x2A26) = FIRMWARE_VERSION. Since this build's version contains
+ *   "yellow", the OTA updater reads it on connect and routes to the yellow
+ *   firmware repo (edge-firmware-yellow); gray has no DIS → stays on the normal
+ *   repo. Read-only, no other behavior change.
+ *
  * CHANGELOG v4.17.8 (yellow-dither tuned defaults 2) — YELLOW LENS BUILD:
  * - New bench-tuned compiled defaults: 120Hz, window min=0% max=100%, low γ=0.5,
  *   knee=command 45 @ level 10%, high γ=2.2. Exhale defaults mirror inhale (split
@@ -1687,7 +1694,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.17.8-yellow-dither"
+#define FIRMWARE_VERSION "4.17.9-yellow-dither"
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
  * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
@@ -5195,6 +5202,12 @@ static const ble_uuid16_t CHR_UUID_CTRL      = BLE_UUID16_INIT(GATTS_CHAR_UUID_C
 static const ble_uuid16_t CHR_UUID_OTA       = BLE_UUID16_INIT(GATTS_CHAR_UUID_OTA);
 static const ble_uuid16_t CHR_UUID_STATUS    = BLE_UUID16_INIT(GATTS_CHAR_UUID_STATUS);
 static const ble_uuid16_t CHR_UUID_PPG       = BLE_UUID16_INIT(GATTS_CHAR_UUID_PPG);
+/* v4.17.9: standard Device Information Service (0x180A) → Firmware Revision
+ * String (0x2A26) = FIRMWARE_VERSION. The OTA updater reads this to learn the
+ * running build; because FIRMWARE_VERSION contains "yellow" on this build, the
+ * updater routes to the yellow firmware repo (gray reports no DIS → default). */
+static const ble_uuid16_t SVC_UUID_DIS       = BLE_UUID16_INIT(0x180A);
+static const ble_uuid16_t CHR_UUID_FW_REV    = BLE_UUID16_INIT(0x2A26);
 
 /* Forward decls — access callbacks are defined below the service table. */
 static int access_ctrl_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -5203,6 +5216,8 @@ static int access_ota_cb(uint16_t conn_handle, uint16_t attr_handle,
                          struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int access_notify_only_cb(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg);
+static int access_dis_fw_cb(uint16_t conn_handle, uint16_t attr_handle,
+                            struct ble_gatt_access_ctxt *ctxt, void *arg);
 static void start_advertising(void);
 
 /* GATT service table — mirrors earclip's NARBIS_CHRS / NARBIS_SVC_DEFS.
@@ -5237,11 +5252,27 @@ static const struct ble_gatt_chr_def DASHBOARD_CHRS[] = {
     { 0 }
 };
 
+/* Device Information Service characteristics — Firmware Revision String only. */
+static const struct ble_gatt_chr_def DIS_CHRS[] = {
+    {
+        .uuid       = &CHR_UUID_FW_REV.u,
+        .access_cb  = access_dis_fw_cb,
+        .flags      = BLE_GATT_CHR_F_READ,
+        .val_handle = NULL,
+    },
+    { 0 }
+};
+
 static const struct ble_gatt_svc_def DASHBOARD_SVCS[] = {
     {
         .type            = BLE_GATT_SVC_TYPE_PRIMARY,
         .uuid            = &SVC_UUID_DASHBOARD.u,
         .characteristics = DASHBOARD_CHRS,
+    },
+    {
+        .type            = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid            = &SVC_UUID_DIS.u,
+        .characteristics = DIS_CHRS,
     },
     { 0 }
 };
@@ -5257,6 +5288,16 @@ static esp_err_t nimble_notify(uint16_t val_handle, const uint8_t *data, size_t 
     if (om == NULL)              return ESP_ERR_NO_MEM;
     int rc = ble_gatts_notify_custom(g_conn_handle, val_handle, om);
     return (rc == 0) ? ESP_OK : ESP_FAIL;
+}
+
+/* DIS Firmware Revision (0x2A26): read-only, returns FIRMWARE_VERSION so the
+ * OTA updater can identify the running build (and this "…-yellow…" variant). */
+static int access_dis_fw_cb(uint16_t conn_handle, uint16_t attr_handle,
+                            struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    (void)conn_handle; (void)attr_handle; (void)arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
+    int rc = os_mbuf_append(ctxt->om, FIRMWARE_VERSION, strlen(FIRMWARE_VERSION));
+    return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
 /* CTRL char (0xFF01): pull the write payload into a flat buffer and hand
