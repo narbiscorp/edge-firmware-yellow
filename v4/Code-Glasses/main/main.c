@@ -2890,6 +2890,25 @@ static volatile uint8_t coh_pacer_current_bpm = 0;
  ******************************************************************************/
 static void prefs_load(void) {
     brightness          = prefs_get_u8 (KEY_BRIGHTNESS,       DEFAULT_BRIGHTNESS);
+    /* v4.16.2: self-heal a persisted brightness of 0.
+     *
+     * brightness multiplies BREATHE/STROBE/COHERENCE output, so 0 means the
+     * lens never tints in ANY program — the device looks broken, and because
+     * the indicator pulses ignore brightness it still pulses on hall tap,
+     * which makes it look like working hardware running dead programs.
+     * A standalone user has no way out of that state without an app.
+     *
+     * 0 is never a useful saved setting for a device whose entire function is
+     * tinting, so treat it as corruption and restore the default. An app can
+     * still drive the lens fully clear at any moment via 0xA5/legacy-duty
+     * (which, as of v4.16.2, no longer writes brightness at all) — this only
+     * governs the value restored at power-on. */
+    if (brightness == 0) {
+        ESP_LOGW(TAG, "prefs: saved brightness was 0 (all programs would render "
+                      "clear) — restoring %d%%", DEFAULT_BRIGHTNESS);
+        brightness = DEFAULT_BRIGHTNESS;
+        prefs_set_u8(KEY_BRIGHTNESS, DEFAULT_BRIGHTNESS);
+    }
     uint32_t sess_min   = prefs_get_u32(KEY_SESSION_MIN,      DEFAULT_SESSION_MIN);
     session_duration_ms = sess_min * 60 * 1000;
     strobe_dhz          = prefs_get_u8 (KEY_STROBE_DHZ,       DEFAULT_STROBE_DHZ / 10) * 10;
@@ -5318,10 +5337,15 @@ static void process_command(uint8_t *data, uint16_t len) {
         uint8_t byte = data[0];
         uint8_t duty = (byte * 100) / 255;
         ESP_LOGI(TAG, "Legacy duty: %d%% (byte 0x%02X)", duty, byte);
-        brightness = duty;
+        /* v4.16.2: do NOT touch `brightness` here. See the 0xA5 handler for
+         * the full explanation — in short, `brightness` is the persistent
+         * max-tint that scales BREATHE/STROBE/COHERENCE, and letting a
+         * momentary static-dim write clobber it silently disables every
+         * other program. STATIC is driven entirely through
+         * lens_apply_static(duty); it never reads `brightness`. */
         strobe_stop();
         led_mode = LED_MODE_STATIC;
-        lens_apply_static(brightness);   /* v4.15.7: honors smoothing/slew knobs */
+        lens_apply_static(duty);         /* v4.15.7: honors smoothing/slew knobs */
         return;
     }
     
@@ -5424,13 +5448,37 @@ static void process_command(uint8_t *data, uint16_t len) {
 #endif /* FCC_TEST_BUILD */
 
         /* ── MODE SWITCHING ────────────────────────────────── */
-        case 0xA5:  /* Enter STATIC mode */
+        case 0xA5:  /* Enter STATIC mode at arg% tint.
+                     *
+                     * v4.16.2 — THE BUG THIS FIXES. This used to do
+                     * `brightness = arg`, which was silently catastrophic:
+                     * `brightness` is the persistent max-tint that MULTIPLIES
+                     * the output of every other program —
+                     *   BREATHE:    effective_duty = frac × brightness
+                     *   STROBE:     effective_duty = is_dark ? brightness : 0
+                     *   COHERENCE:  effective_duty = brightness × f(coh)
+                     * so a single `A5 00` (an app or bridge driving the lens
+                     * clear via proportional dimming — exactly what a
+                     * neurofeedback bridge does on every reward) left
+                     * brightness at 0, and from that moment breathe, strobe
+                     * and coherence all rendered permanently CLEAR. The
+                     * program-indicator pulses kept working, because
+                     * indicator_tick() uses its own hardcoded 0-100 envelope
+                     * and never consults brightness — so the glasses looked
+                     * alive (pulses on hall tap) while every actual program
+                     * did nothing. That is a near-undiagnosable failure from
+                     * the outside.
+                     *
+                     * STATIC never needed brightness: the whole mode runs
+                     * through lens_apply_static(duty) and the glide engine.
+                     * So the assignment is simply gone. `brightness` is now
+                     * owned solely by 0xA2 (persistent max tint), as its
+                     * documentation always claimed. */
             if (arg > 100) arg = 100;
-            brightness = arg;
             strobe_stop();
             led_mode = LED_MODE_STATIC;
-            lens_apply_static(brightness);   /* v4.15.7: honors smoothing/slew knobs */
-            ESP_LOGI(TAG, "Mode: STATIC @ %d%%", arg);
+            lens_apply_static(arg);          /* v4.15.7: honors smoothing/slew knobs */
+            ESP_LOGI(TAG, "Mode: STATIC @ %d%% (brightness %d%% untouched)", arg, brightness);
             break;
             
         case 0xA6:  /* Enter STROBE mode */
