@@ -109,6 +109,13 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  *
+ * CHANGELOG v4.18.1 (yellow: silent program 1) — YELLOW LENS BUILD:
+ * - Ported gray v4.16.1's program-1 indicator silence. Program 1 (BREATHE, where
+ *   every power-on lands) no longer fires the 1-pulse "which program" indicator —
+ *   opening the glasses goes straight into the tint program with NO startup flash.
+ *   Programs 2/3 still pulse 2×/3×; cycling back to 1 is silent. New wrapper
+ *   program_indicator() gates it; semantic indicators (sensor/earclip) unchanged.
+ *
  * CHANGELOG v4.18.0 (yellow + battery) — YELLOW LENS BUILD:
  * - Ported the glasses self-battery monitor from gray v4.16.1: boot-probed VBAT
  *   divider (GPIO36 / ADC1_CH0 primary, alternates 39/34/32/33), SOC estimate,
@@ -1707,7 +1714,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.18.0-yellow-battery"
+#define FIRMWARE_VERSION "4.18.1-yellow-battery"
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
  * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
@@ -2277,6 +2284,18 @@ static void indicator_trigger(uint8_t count, uint32_t hold_ms) {
                       + (uint32_t)count * INDICATOR_PULSE_MS
                       + INDICATOR_POST_DELAY_MS
                       + hold_ms);
+}
+
+/* v4.18.1 (ported from gray v4.16.1): "which program am I on" N-pulse indicator.
+ * Program 1 is SILENT — opening the glasses (every power-on lands on program 1,
+ * current_program is not persisted) or cycling back around to it drops straight
+ * into the breathe program with no flash. Programs 2..N still pulse N times.
+ * Only the program indicator is gated; the fixed semantic indicators (5-pulse
+ * sensor handshake, 3/2-pulse earclip link/lost, etc.) still fire via
+ * indicator_trigger() directly. Takes the 1-based program number. */
+static void program_indicator(uint8_t program_1based) {
+    if (program_1based <= 1) return;   /* program 1 = silent, no startup pulse */
+    indicator_trigger(program_1based, 0);
 }
 
 /* Compute current indicator duty output (0-100 percent value).
@@ -4064,7 +4083,9 @@ static void led_task(void *param) {
         if (!boot_indicator_shown &&
             xTaskGetTickCount() >= boot_indicator_due_tick) {
             if (!ppg_auto_active) {
-                indicator_trigger((uint8_t)(current_program + 1), 0);
+                /* v4.18.1: silent for program 1 (every boot lands here) — no
+                 * startup flash; program 2+ still announces. See program_indicator(). */
+                program_indicator((uint8_t)(current_program + 1));
             }
             boot_indicator_shown = true;
         }
@@ -4570,8 +4591,10 @@ static void hall_task(void *param) {
                     ESP_LOGI(TAG, "Hall short-tap %lums → advance to program %d",
                              held_ms, next);
                     apply_program(next);
-                    /* v4.14.2: indicator shows new program (1-based count) */
-                    indicator_trigger((uint8_t)(next + 1), 0);
+                    /* v4.14.2: indicator shows new program (1-based count).
+                     * v4.18.1: program 1 is silent — cycling back to it drops
+                     * straight into breathe with no flash. See program_indicator(). */
+                    program_indicator((uint8_t)(next + 1));
                 }
                 /* v4.14.34: refresh BLE advertising window on user interaction. */
                 if (ble_stack_up && !is_connected) {
