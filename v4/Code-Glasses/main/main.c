@@ -6205,7 +6205,16 @@ static const struct ble_gatt_chr_def DASHBOARD_CHRS[] = {
     {
         .uuid       = &CHR_UUID_CTRL.u,
         .access_cb  = access_ctrl_cb,
-        .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+        /* v4.16.3: added WRITE_NO_RSP so real-time clients (neurofeedback
+         * dimmers) can stream [0xA5,duty] without an ATT round-trip per write,
+         * lifting the sustained lens-update rate above the ~8-20/sec that
+         * write-with-response allows. NimBLE delivers a write-without-response
+         * as the same BLE_GATT_ACCESS_OP_WRITE_CHR, so access_ctrl_cb /
+         * process_command handle both forms unchanged; with-response writes
+         * are unaffected. Same flag the OTA data char (0xFF02) already uses.
+         * Adding a property does not change the 0xFF01 attribute handle. */
+        .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE |
+                      BLE_GATT_CHR_F_WRITE_NO_RSP,
         .val_handle = NULL,
     },
     {
