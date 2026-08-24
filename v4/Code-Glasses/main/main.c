@@ -134,6 +134,45 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  *
+ * CHANGELOG v4.19.0 (yellow: gray parity sweep) -- YELLOW LENS BUILD:
+ * - Brings this build level with narbiscorp/edge-firmware main (gray) as of
+ *   gray v4.16.3, plus gray's standalone-programs work (gray v4.17.0). Yellow
+ *   had already ported gray v4.16.1's battery monitor (4.18.0) and silent
+ *   program-1 indicator (4.18.1); everything else gray landed after the fork
+ *   at "BLE idle timeout 5->2 min" is now here:
+ *     gray 4.15.7  lens config knobs 0xA0 smoothing / 0xA1 slew / 0xA3
+ *                  disconnect fail-clear (persisted, all default 0 = old
+ *                  behavior)
+ *     gray 4.15.8  smoothing glide no longer stalls short of target under a
+ *                  continuous single-byte PWM stream
+ *     gray 4.15.9  smoothed STATIC drives at full PWM resolution instead of
+ *                  101 integer duty steps (gray amplitude path)
+ *     gray 4.15.10 FCC DTM test mode + DTM lens pulse, behind FCC_TEST_BUILD
+ *                  (compiled out of production; see the collision note below)
+ *     gray 4.15.11 0xA0/0xA1/0xA3 confirm their applied value over BLE
+ *     gray 4.16.2  0xA5 STATIC and the legacy 1-byte duty write no longer
+ *                  clobber `brightness`, which silently rendered every
+ *                  program clear; a persisted brightness of 0 self-heals
+ *     gray 4.16.3  0xFF01 also accepts write-without-response, lifting the
+ *                  real-time lens streaming rate
+ *     gray 4.17.0  standalone programs 2 (BREATHE+STROBE) and 3 (STROBE) are
+ *                  out of the default arm-tap cycle. program_t is replaced by
+ *                  5 NVS-backed slots + a count (0xBC/0xBD/0xBE); sa_count
+ *                  defaults to 1, so a close-and-reopen of the arm no longer
+ *                  drops the wearer into a strobe they did not ask for. Up to
+ *                  5 programs can be configured from the app. Full detail in
+ *                  the v4.17.0 block below and STANDALONE_PROGRAMS_APP_HANDOFF.md.
+ * - Yellow-only addition: gray 4.15.9's fix has no direct analogue on the
+ *   bridge (there is no amplitude to refine -- the cell is driven binary), so
+ *   the same requantization is removed one step later, by interpolating
+ *   dither_lut[] with the glide's Q8 fraction. Same gate as gray, and inert
+ *   until the 0xA0 smoothing knob is turned on.
+ * - Opcode collision, yellow only: the FCC/DTM build reuses 0xAE/0xAF/0xBB,
+ *   which on this build are the dither-curve / dither-frequency / exhale-split
+ *   knobs. The knobs are therefore compiled out of an FCC build (see
+ *   process_command). Production yellow builds are unaffected; both variants
+ *   compile clean on ESP-IDF v5.5.1.
+ *
  * CHANGELOG v4.18.5 (yellow: FIX bricked lens from v4.18.3) — YELLOW LENS BUILD:
  * - CRITICAL. v4.18.3's gpio_hold_en() on the lens pins (GPIO27/26) before deep
  *   sleep latched them low; those are RTC pins, so the hold survived reboot AND
@@ -3650,7 +3689,25 @@ static bool IRAM_ATTR drive_timer_cb(gptimer_handle_t timer,
     const volatile uint32_t *lut =
         (dither_split && dither_dir_exhale && led_mode == LED_MODE_BREATHE)
         ? dither_lut_ex : dither_lut;
-    uint8_t is_on = (dither_acc < lut[tint]) ? 1 : 0;
+    /* v4.19.0 (yellow half of gray v4.15.9): in plain smoothed STATIC the
+     * command reaching the LUT is an integer 0..100, so a slow glide steps the
+     * dither on-fraction in 101 jumps -- the same requantization the gray build
+     * fixed by publishing a 10-bit raw. The bridge has no amplitude to refine,
+     * so refine the LUT lookup instead: interpolate between lut[n] and lut[n+1]
+     * with the glide accumulator's Q8 fraction. Gated exactly like the gray
+     * path, and inert unless the smoothing knob (0xA0) is on -- with it off
+     * lens_fine_raw stays -1 and this is bit-for-bit the old lookup. */
+    uint32_t thresh = lut[tint];
+    if (lens_fine_raw >= 0 && led_mode == LED_MODE_STATIC && !ind_owns
+        && session_active && !in_ota_mode) {
+        int32_t q8 = (int32_t)lens_smooth_q8;
+        if (q8 > (100 << 8)) q8 = 100 << 8;
+        int32_t n  = q8 >> 8;
+        int32_t lo = (int32_t)lut[n];
+        int32_t hi = (int32_t)lut[n < 100 ? n + 1 : 100];
+        thresh = (uint32_t)(lo + (((hi - lo) * (q8 & 0xFF)) >> 8));
+    }
+    uint8_t is_on = (dither_acc < thresh) ? 1 : 0;
 
     /* DC balance: alternate AC start polarity at each off→on edge so every
      * on-burst pairs with an opposite-polarity neighbour (mirrors the strobe
