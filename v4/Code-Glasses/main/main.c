@@ -109,6 +109,14 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  *
+ * CHANGELOG v4.18.3 (yellow: sleep pin latch) — YELLOW LENS BUILD:
+ * - Latch the lens pins LOW through deep sleep (gpio_hold + deep_sleep_hold).
+ *   Unheld, they drift to Hi-Z once asleep and the DRV8837 inputs can sit at an
+ *   intermediate level (partial conduction = wasted current). Held low keeps the
+ *   driver firmly in coast = lowest bridge draw. Does NOT touch the LM2665/
+ *   DRV8837 quiescent (SD→GND, nSLEEP→3V3 hardwired) — that floor needs the
+ *   board mod (gate the bridge 3V3 or nSLEEP from a spare GPIO).
+ *
  * CHANGELOG v4.18.2 (yellow: drive power fix) — YELLOW LENS BUILD:
  * - Removed a wasteful 10kHz switching artifact in the bridge drive. The "on"
  *   state used PWM_MAX_RAW (1023), leaving the driven-low pin at duty 1/1024 —
@@ -1726,7 +1734,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.18.2-yellow-battery"
+#define FIRMWARE_VERSION "4.18.3-yellow-battery"
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
  * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
@@ -4471,17 +4479,34 @@ static void led_task(void *param) {
  ******************************************************************************/
 static void enter_deep_sleep(void) {
     ESP_LOGI(TAG, "Entering deep sleep...");
-    
+
     /* Clear lens and stop unified timer */
     effective_duty = 0;
     vTaskDelay(pdMS_TO_TICKS(10));  /* Let timer apply zero duty */
     gptimer_stop(drive_timer);
     gptimer_disable(drive_timer);
     pwm_both_off();
-    
+
+    /* v4.18.3 bridge-sleep power: LATCH both lens pins LOW through deep sleep.
+     * On the yellow bridge these feed DRV8837 IN1/IN2. Once the ESP32 sleeps,
+     * unheld pads drift to Hi-Z — the DRV8837 inputs can then sit at an
+     * intermediate level and the H-bridge partially conducts, wasting current.
+     * Driving them low as plain GPIOs and holding the pads keeps the driver
+     * firmly in COAST (outputs Hi-Z, cell floats & self-bleeds clear) = lowest
+     * bridge draw. Harmless on gray (direct-drive) hardware. NOTE: this does NOT
+     * touch the LM2665/DRV8837 quiescent (nSLEEP→3V3, SD→GND hardwired) — that
+     * floor needs the board mod (gate the bridge 3V3 / nSLEEP from a GPIO). */
+    gpio_set_direction((gpio_num_t)PWM1_OUTPUT_IO, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)PWM1_OUTPUT_IO, 0);
+    gpio_set_direction((gpio_num_t)PWM2_OUTPUT_IO, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)PWM2_OUTPUT_IO, 0);
+    gpio_hold_en((gpio_num_t)PWM1_OUTPUT_IO);
+    gpio_hold_en((gpio_num_t)PWM2_OUTPUT_IO);
+    gpio_deep_sleep_hold_en();
+
     /* Configure wake on Hall sensor LOW (arm opened) */
     esp_sleep_enable_ext0_wakeup(HALL_PIN, 0);
-    
+
     esp_deep_sleep_start();
 }
 
