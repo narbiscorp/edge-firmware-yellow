@@ -134,6 +134,19 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  *
+ * CHANGELOG v4.19.1 (yellow: sleep current) -- YELLOW LENS BUILD:
+ * - Restores v4.18.3's deep-sleep pad hold on the lens pins, which v4.18.5 had
+ *   removed as "redundant". It is not: bench-measured ~800 uA asleep with the
+ *   hold vs >1 mA without. See the comment in enter_deep_sleep() for why the
+ *   v4.18.3 brick cannot recur -- the hold is now released on every boot in
+ *   app_main() AND again in pwm_init(), before the lens is ever driven.
+ * - This is the last firmware lever on sleep current. The remaining ~800 uA is
+ *   the LM2665 doubler + DRV8837 quiescent (SD->GND, nSLEEP->3V3 hardwired on
+ *   the v4 board) plus the ESP32's own ~10-20 uA deep sleep. GPIO27/26 are the
+ *   only outputs on the board, RTC slow clock is already the internal RC, there
+ *   is no ULP and no RTC_DATA_ATTR retention to power. Going below this needs
+ *   the board mod: gate the bridge's 3V3, or route nSLEEP/SD to a spare GPIO.
+ *
  * CHANGELOG v4.19.0 (yellow: gray parity sweep) -- YELLOW LENS BUILD:
  * - Brings this build level with narbiscorp/edge-firmware main (gray) as of
  *   gray v4.16.3, plus gray's standalone-programs work (gray v4.17.0). Yellow
@@ -190,6 +203,10 @@
  *   dis at the very start of app_main so every boot releases the latch and
  *   recovers an affected unit on reflash. The v4.18.2 (clean drive) and v4.18.4
  *   (coast-when-clear) power fixes are retained.
+ *   SUPERSEDED IN PART by v4.19.1: part (2), the boot-time release, is what
+ *   actually fixes the brick and it stays. Part (1) was wrong on the power
+ *   claim -- the hold is worth ~200 uA and is restored, now that the release
+ *   guarantees it cannot outlive the sleep.
  *
  * CHANGELOG v4.18.4 (yellow: coast when clear) — YELLOW LENS BUILD:
  * - Drive the bridge in COAST (both DRV8837 inputs low → outputs Hi-Z, cell
@@ -1968,9 +1985,9 @@
  *   all unchanged. */
 
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.19.0-yellow-FCC-TEST"
+#define FIRMWARE_VERSION "4.19.1-yellow-FCC-TEST"
 #else
-#define FIRMWARE_VERSION "4.19.0-yellow"
+#define FIRMWARE_VERSION "4.19.1-yellow"
 #endif
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
@@ -3521,6 +3538,14 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg);
  * PWM FUNCTIONS
  ******************************************************************************/
 static void pwm_init(void) {
+    /* v4.19.1: belt-and-braces release of the deep-sleep pad hold set by
+     * enter_deep_sleep(). app_main() already does this on every boot; repeating
+     * it here means ANY path that (re)initializes the lens PWM also clears the
+     * latch, so the v4.18.3 brick cannot recur through some future call order. */
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis((gpio_num_t)PWM1_OUTPUT_IO);
+    gpio_hold_dis((gpio_num_t)PWM2_OUTPUT_IO);
+
     /* Configure timer (shared by both channels) */
     ledc_timer_config_t timer_conf = {
         .speed_mode       = PWM1_MODE,
@@ -5206,16 +5231,36 @@ static void enter_deep_sleep(void) {
     gptimer_disable(drive_timer);
     pwm_both_off();
 
-    /* v4.18.5: the v4.18.3 "gpio_hold_en on the lens pins through deep sleep"
-     * is REMOVED — it BRICKED the lens. GPIO27/26 are RTC pins, so the hold
-     * latched them low and PERSISTED across reboot AND reflash; on wake the LEDC
-     * could no longer drive them (lenses dead, BLE fine) and only a power-cycle
-     * (or the boot-time gpio_hold_dis added in app_main) clears it. It was also
-     * pointless: with the pins Hi-Z in deep sleep the DRV8837's internal input
-     * pulldowns already hold IN1/IN2 low = coast. pwm_both_off() above is enough. */
-
     /* Configure wake on Hall sensor LOW (arm opened) */
     esp_sleep_enable_ext0_wakeup(HALL_PIN, 0);
+
+    /* v4.19.1: re-latch the lens pins LOW through deep sleep.
+     *
+     * This is v4.18.3's hold, restored. It is worth ~200 uA: bench-measured
+     * 2026-08-24, ~800 uA asleep with the hold vs >1 mA without. Left unheld,
+     * GPIO27/26 revert to their reset state as the digital domain powers down
+     * and the DRV8837's IN1/IN2 float to an intermediate level -- partial
+     * conduction in its input stage, burning that 200 uA for the whole sleep.
+     * The "the DRV8837 pulldowns already coast the pins" reasoning that removed
+     * it in v4.18.5 is contradicted by the meter.
+     *
+     * WHY THIS IS SAFE NOW. v4.18.3 BRICKED the lens with exactly this call.
+     * GPIO27/26 are RTC pads, so the latch survived reboot AND reflash, and
+     * v4.18.3 never released it -- on wake the LEDC could no longer drive the
+     * pins (lenses dead, BLE fine) and only a power cycle cleared it. The bug
+     * was the missing release, not the hold. Two independent releases now run
+     * before the lens is ever driven: app_main() clears both pads first thing
+     * on EVERY boot (a deep-sleep wake is a boot), and pwm_init() clears them
+     * again immediately before configuring LEDC. A latch cannot outlive the
+     * sleep it was set for, and a unit still stuck from v4.18.3 recovers on
+     * the next flash or wake.
+     *
+     * KEEP THIS LAST. gpio_hold_en() takes effect immediately, not at sleep
+     * entry, so any code between here and esp_deep_sleep_start() would find
+     * the lens frozen. */
+    gpio_hold_en((gpio_num_t)PWM1_OUTPUT_IO);
+    gpio_hold_en((gpio_num_t)PWM2_OUTPUT_IO);
+    gpio_deep_sleep_hold_en();
 
     esp_deep_sleep_start();
 }
