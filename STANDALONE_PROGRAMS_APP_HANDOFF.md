@@ -2,6 +2,14 @@
 
 **Firmware:** v4.17.0 (`Narbis_Edge`, glasses).
 
+**Yellow-lens units:** the same feature ships in the yellow build as **v4.19.0-yellow**
+(separate repo `edge-firmware-yellow`, separate OTA channel; the yellow version line
+was already past 4.17 when this landed). The protocol in §3 is identical. Where this
+document says "gate on firmware ≥ 4.17.0", parse the leading `major.minor.patch`
+and ignore the `-yellow` suffix — 4.19.0-yellow passes that gate correctly. Yellow
+also self-identifies through DIS `0x180A` / Firmware Revision `0x2A26`.
+
+
 **Audience:** the iOS (Swift/CoreBluetooth) agent. §9 is a self-contained prompt
 you can work from alone. The Kotlin/Android agent can follow the same protocol —
 §3 is platform-neutral.
