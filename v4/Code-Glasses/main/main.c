@@ -109,6 +109,18 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  *
+ * CHANGELOG v4.18.5 (yellow: FIX bricked lens from v4.18.3) — YELLOW LENS BUILD:
+ * - CRITICAL. v4.18.3's gpio_hold_en() on the lens pins (GPIO27/26) before deep
+ *   sleep latched them low; those are RTC pins, so the hold survived reboot AND
+ *   reflash → after the first sleep→wake the LEDC could not drive the lens
+ *   (lenses dead, BLE still connectable), and reflashing OLD firmware did not
+ *   help (only a power-cycle clears the RTC latch). Fix: (1) removed the hold
+ *   from enter_deep_sleep (it was redundant — the DRV8837 input pulldowns
+ *   already coast the pins in sleep); (2) added gpio_hold_dis + deep_sleep_hold_
+ *   dis at the very start of app_main so every boot releases the latch and
+ *   recovers an affected unit on reflash. The v4.18.2 (clean drive) and v4.18.4
+ *   (coast-when-clear) power fixes are retained.
+ *
  * CHANGELOG v4.18.4 (yellow: coast when clear) — YELLOW LENS BUILD:
  * - Drive the bridge in COAST (both DRV8837 inputs low → outputs Hi-Z, cell
  *   floats & self-bleeds) whenever the lens is fully clear (command 0), instead
@@ -1742,7 +1754,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.18.4-yellow-battery"
+#define FIRMWARE_VERSION "4.18.5-yellow-battery"
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
  * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
@@ -4506,22 +4518,13 @@ static void enter_deep_sleep(void) {
     gptimer_disable(drive_timer);
     pwm_both_off();
 
-    /* v4.18.3 bridge-sleep power: LATCH both lens pins LOW through deep sleep.
-     * On the yellow bridge these feed DRV8837 IN1/IN2. Once the ESP32 sleeps,
-     * unheld pads drift to Hi-Z — the DRV8837 inputs can then sit at an
-     * intermediate level and the H-bridge partially conducts, wasting current.
-     * Driving them low as plain GPIOs and holding the pads keeps the driver
-     * firmly in COAST (outputs Hi-Z, cell floats & self-bleeds clear) = lowest
-     * bridge draw. Harmless on gray (direct-drive) hardware. NOTE: this does NOT
-     * touch the LM2665/DRV8837 quiescent (nSLEEP→3V3, SD→GND hardwired) — that
-     * floor needs the board mod (gate the bridge 3V3 / nSLEEP from a GPIO). */
-    gpio_set_direction((gpio_num_t)PWM1_OUTPUT_IO, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)PWM1_OUTPUT_IO, 0);
-    gpio_set_direction((gpio_num_t)PWM2_OUTPUT_IO, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)PWM2_OUTPUT_IO, 0);
-    gpio_hold_en((gpio_num_t)PWM1_OUTPUT_IO);
-    gpio_hold_en((gpio_num_t)PWM2_OUTPUT_IO);
-    gpio_deep_sleep_hold_en();
+    /* v4.18.5: the v4.18.3 "gpio_hold_en on the lens pins through deep sleep"
+     * is REMOVED — it BRICKED the lens. GPIO27/26 are RTC pins, so the hold
+     * latched them low and PERSISTED across reboot AND reflash; on wake the LEDC
+     * could no longer drive them (lenses dead, BLE fine) and only a power-cycle
+     * (or the boot-time gpio_hold_dis added in app_main) clears it. It was also
+     * pointless: with the pins Hi-Z in deep sleep the DRV8837's internal input
+     * pulldowns already hold IN1/IN2 low = coast. pwm_both_off() above is enough. */
 
     /* Configure wake on Hall sensor LOW (arm opened) */
     esp_sleep_enable_ext0_wakeup(HALL_PIN, 0);
@@ -7340,6 +7343,16 @@ static void central_log_sink(const char *msg) {
  ******************************************************************************/
 void app_main(void) {
     esp_err_t ret;
+
+    /* v4.18.5 CRITICAL RECOVERY: release any latched pad-hold on the lens pins
+     * left by v4.18.3. That build called gpio_hold_en() on GPIO27/26 (RTC pins)
+     * before deep sleep and never released it — the latch survived reboot AND
+     * reflash, so the LEDC could not drive the lens (lenses dead, BLE fine).
+     * Clearing it here, first thing on EVERY boot, un-bricks such a unit on
+     * reflash and is a harmless no-op otherwise. Must run before pwm_init(). */
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis((gpio_num_t)PWM1_OUTPUT_IO);
+    gpio_hold_dis((gpio_num_t)PWM2_OUTPUT_IO);
 
     /* v4.12.9: drop CPU to 80MHz for power savings.
      *
