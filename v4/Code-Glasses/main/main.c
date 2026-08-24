@@ -162,6 +162,12 @@
  *                  drops the wearer into a strobe they did not ask for. Up to
  *                  5 programs can be configured from the app. Full detail in
  *                  the v4.17.0 block below and STANDALONE_PROGRAMS_APP_HANDOFF.md.
+ * - Battery block realigned with gray's. The 4.18.0 port had drifted from the
+ *   gray v4.16.1 source: it gated the whole monitor on the U4WDH efuse package
+ *   (a false-negative risk on a production unit whose efuse reads oddly), had
+ *   no NVS pin cache (KEY_BATT_CH), and its 0xC7 0x01 diagnostic printed eight
+ *   readings out of a five-entry probe array -- three of them out of bounds,
+ *   with stale pin labels. The block is now gray's verbatim.
  * - Yellow-only addition: gray 4.15.9's fix has no direct analogue on the
  *   bridge (there is no amplitude to refine -- the cell is driven binary), so
  *   the same requantization is removed one step later, by interpolating
@@ -1975,8 +1981,11 @@
 /* v4.18.0: glasses-side battery monitoring, ported from gray v4.16.1. Locates
  * the PCB1_3 VBAT divider (R17/R18 1M/1M + C23 100nF), estimates state-of-
  * charge, and reports it via a 0xFB status frame plus the standard BLE Battery
- * Service (0x180F). Opcode 0xC7 polls / dumps probe diagnostics. Old dev boards
- * (non-U4WDH package) report "unsupported" instead of garbage. */
+ * Service (0x180F). Opcode 0xC7 polls / dumps probe diagnostics. Boards with no
+ * divider fitted (V1.1) report "unsupported" instead of garbage.
+ * v4.19.0: this block is now byte-identical to gray's -- the earlier port had
+ * drifted (it gated on the U4WDH efuse package, had no NVS pin cache, and its
+ * 0xC7 0x01 dump indexed 8 slots of a 5-entry probe array). */
 static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
@@ -2930,6 +2939,10 @@ static uint8_t adapt_resp_quintet(void) {
 #define KEY_SMOOTH_TAU         "smth_tau"
 #define KEY_SLEW_MAX           "slew_max"
 #define KEY_DC_BEHAV           "dc_behav"
+/* v4.16.1: ADC1 channel confirmed to carry the VBAT divider. Cached after a
+ * successful probe so later boots go straight to the known-good pin instead
+ * of re-scanning. 0xFF = not yet known. Cleared by 0xC7 0x01 (reprobe). */
+#define KEY_BATT_CH            "batt_ch"
 
 /* v4.17.0: standalone program table. KEY_SA_COUNT is how many slots the arm
  * cycles (1 = cycle off, the default); KEY_SA_TABLE is the packed slot blob,
@@ -4206,25 +4219,44 @@ static void send_status_frame(uint8_t type, const uint8_t *payload, size_t len) 
 }
 
 /*******************************************************************************
- * GLASSES BATTERY MONITOR (v4.16.0)
+ * GLASSES BATTERY MONITOR (v4.16.0, pin corrected v4.16.1)
  *
- * Reads the glasses' own battery through the VBAT divider added on PCB rev
- * 1.3 (BOM V1.3 2026-05-21: R17/R18 = 1 MΩ / 1 MΩ from VBAT to GND, C23 =
- * 100 nF on the midpoint). The v1.0 schematic PDF predates the divider, so
- * WHICH ADC pin the midpoint lands on is not documented anywhere we control.
- * Rather than hard-code a guess (see the v4.12.0-v4.12.3 PPG pin saga —
- * GPIO36 vs GPIO35), the divider is located empirically at boot:
+ * Reads the glasses' own battery through a resistive divider on VBAT.
  *
- *   1. Package gate. Production boards use the bare ESP32-U4WDH QFN; the
- *      older dev boards are WROOM-32 modules with a PulseSensor bodged onto
- *      GPIO35 whose ~1.65 V midrail would pass a naive probe. If the efuse
- *      package is not U4WDH, battery monitoring reports "unsupported"
- *      (mv=0, soc=0xFF, charging=0xFF) and never touches the ADC.
- *   2. Probe. Each ADC1 channel is sampled (median of 9); a channel is the
- *      divider iff the reading is stable (span + drift gates below — the
- *      100 nF cap makes the real node rock-solid while floating NC pins
- *      drift) and in the band a 1M/1M divider implies (VBAT 2.7-4.6 V).
- *      GPIO34 (VDET_1) is probed first as the most likely choice.
+ * HARDWARE STATUS — read this before debugging a "no battery" report:
+ *
+ *   - V1.1 (every board in the field today): the divider DOES NOT EXIST.
+ *     BAT+ runs straight to the TP4057 charger and on to the TPS63802
+ *     buck-boost; nothing taps it to an ADC pin. On these units the monitor
+ *     correctly reports unsupported (mv=0, soc=0xFF, charging=0xFF). That is
+ *     the expected, correct result — not a bug to chase.
+ *   - V1.2 respin spec (board STS-USA50925-ESP32-ZZ): divider = 2× 1 MΩ 1%
+ *     0402 + 100 nF X7R on the midpoint, feeding **GPIO36 / SENSOR_VP /
+ *     physical pin 5 / ADC1_CHANNEL_0**. 3.0-4.2 V cell → 1.5-2.1 V at the
+ *     pin, ~2 µA quiescent. ADC1 only, because BLE is always on and ADC2 is
+ *     unusable while the radio runs.
+ *
+ * PIN HISTORY (so nobody "corrects" this back): the April PCB review split
+ * the two analog inputs GPIO36 → PulseSensor and GPIO39 → battery. The May
+ * standalone-battery spec narrowed scope to battery only and made GPIO36 the
+ * primary, with GPIO39/34/32/33 as alternates. This firmware runs PPG on
+ * GPIO35 (see PPG_ADC_GPIO), so GPIO36-for-battery does not collide. If a
+ * future board puts the PulseSensor back on GPIO36, the split assignment
+ * must come back and BATT_PRIMARY_CH must move to GPIO39.
+ *
+ * Pin selection at boot, in order:
+ *   1. NVS cache (KEY_BATT_CH) — a channel confirmed by an earlier probe.
+ *   2. GPIO36 (the V1.2 spec pin).
+ *   3. Alternates GPIO39/34/32/33, in that order.
+ * A candidate is accepted only if its reading is BOTH in the band a ÷2
+ * divider implies AND electrically stable (span + drift gates). The 100 nF
+ * cap makes a real divider node rock-solid; an unconnected pin drifts, so
+ * the stability gate is what keeps a floating V1.1 pin from inventing a
+ * battery reading.
+ *
+ * GPIO35 IS DELIBERATELY NOT A CANDIDATE. It carries the PulseSensor, whose
+ * ~1.65 V midrail doubles to a perfectly plausible 3.3 V "battery" — a
+ * guaranteed false positive. Never add it to the candidate list.
  *
  * Reporting, once per BATT_EMIT_PERIOD_MS and immediately on subscribe /
  * 0xC7 poll:
@@ -4236,9 +4268,13 @@ static void send_status_frame(uint8_t type, const uint8_t *payload, size_t len) 
  *     bridge, nRF Connect, and any generic client see battery with zero
  *     custom protocol work.
  *
- * charging is a best-effort slope heuristic (no CHRG/STDBY route to the
- * MCU on this PCB): smoothed VBAT rising ≥ +20 mV over the 90 s lookback
- * → 1, falling → 0, else hold. Documented as best-effort in the SDK.
+ * charging is a best-effort slope heuristic (the TP4057's CHRG/STDBY pins
+ * drive indicator LEDs only — they have no route to the MCU): smoothed VBAT
+ * rising ≥ +20 mV over the 90 s lookback → 1, falling → 0, else hold.
+ *
+ * The earclip is a different device entirely (XIAO ESP32-C6, GPIO-switched
+ * divider ground leg). None of this applies to it; its battery arrives
+ * pre-computed over the relay as 0xF8.
  ******************************************************************************/
 /* v4.17.0: standalone-program config readback frame (reply to 0xBE).
  * Declared here alongside BATT_FRAME_TYPE so the 0xFF03 frame-type
@@ -4246,25 +4282,30 @@ static void send_status_frame(uint8_t type, const uint8_t *payload, size_t len) 
 #define SA_CONFIG_FRAME_TYPE    0xFC
 
 #define BATT_FRAME_TYPE         0xFB
-#define BATT_DIVIDER_NUM        2u          /* VBAT = pin_mv × 2 (R17 = R18 = 1 MΩ) */
+#define BATT_DIVIDER_NUM        2u          /* VBAT = pin_mv × 2 (both legs 1 MΩ) */
 #define BATT_SAMPLE_PERIOD_MS   10000
 #define BATT_EMIT_PERIOD_MS     30000
 #define BATT_SOC_UNKNOWN        0xFF
 #define BATT_CHG_UNKNOWN        0xFF
 #define BATT_PROBE_CANDIDATES   5
-#define BATT_PIN_MV_MIN         1350        /* VBAT 2.7 V through the ÷2 divider */
-#define BATT_PIN_MV_MAX         2300        /* VBAT 4.6 V through the ÷2 divider */
+#define BATT_PIN_MV_MIN         1400        /* VBAT 2.8 V through the ÷2 divider */
+#define BATT_PIN_MV_MAX         2250        /* VBAT 4.5 V through the ÷2 divider */
 #define BATT_PROBE_SPAN_MAX_MV  30          /* max p-p across median window */
 #define BATT_PROBE_DRIFT_MAX_MV 20          /* max median drift across 400 ms */
 #define BATT_CHG_RISE_MV        20          /* smoothed rise over lookback → charging */
 #define BATT_CHG_LOOKBACK       9           /* ring slots × 10 s sample = 90 s */
-/* GPIO36 / SENSOR_VP / pin 5 — the V1.2 respin spec pin (matches gray v4.16.1). */
+
+/* GPIO36 / SENSOR_VP / pin 5 — the V1.2 respin spec pin. */
 #define BATT_PRIMARY_CH         ADC1_CHANNEL_0
 
-/* Probe order (gray v4.16.1): GPIO36 (the V1.2 spec pin) first, then alternates
- * GPIO39/34/32/33 in case a board revision moved the divider. */
+/* Candidate order: spec pin first, then the documented alternates.
+ * GPIO35 is absent on purpose — see the block comment above. */
 static const adc1_channel_t BATT_PROBE_CH[BATT_PROBE_CANDIDATES] = {
-    ADC1_CHANNEL_0, ADC1_CHANNEL_3, ADC1_CHANNEL_6, ADC1_CHANNEL_4, ADC1_CHANNEL_5,
+    ADC1_CHANNEL_0,  /* GPIO36 — V1.2 spec */
+    ADC1_CHANNEL_3,  /* GPIO39 — April-review alternate */
+    ADC1_CHANNEL_6,  /* GPIO34 */
+    ADC1_CHANNEL_4,  /* GPIO32 */
+    ADC1_CHANNEL_5,  /* GPIO33 */
 };
 static const uint8_t BATT_PROBE_GPIO[BATT_PROBE_CANDIDATES] = {
     36, 39, 34, 32, 33,
@@ -4272,7 +4313,6 @@ static const uint8_t BATT_PROBE_GPIO[BATT_PROBE_CANDIDATES] = {
 
 static esp_adc_cal_characteristics_t batt_adc_chars;
 static bool     batt_supported = false;
-static bool     batt_pkg_ok    = false;            /* U4WDH package (production PCB) */
 static int8_t   batt_ch        = -1;               /* adc1_channel_t once found */
 static uint8_t  batt_gpio      = 0;                /* GPIO of batt_ch, 0 = none */
 static uint16_t batt_mv        = 0;                /* smoothed VBAT millivolts */
@@ -4346,26 +4386,45 @@ static bool batt_probe_channel(int idx) {
     return true;
 }
 
-/* Full probe pass. Returns true if a divider channel was found. */
-static bool batt_probe(void) {
-    for (int i = 0; i < BATT_PROBE_CANDIDATES; i++) {
-        if (batt_probe_channel(i)) {
-            batt_ch   = (int8_t)BATT_PROBE_CH[i];
-            batt_gpio = BATT_PROBE_GPIO[i];
-            batt_supported = true;
-            ESP_LOGI(TAG, "Battery divider found: GPIO%u (ADC1_CH%d), pin %u mV -> VBAT %u mV",
-                     batt_gpio, (int)batt_ch, batt_probe_result_mv[i],
-                     batt_probe_result_mv[i] * BATT_DIVIDER_NUM);
-            return true;
-        }
-    }
+/* Mark the battery monitor unsupported and reset every derived value, so a
+ * failed (re)probe can never leave a stale reading visible to a client. */
+static void batt_mark_unsupported(void) {
     batt_supported = false;
-    batt_ch   = -1;
-    batt_gpio = 0;
-    batt_mv   = 0;
-    batt_soc  = BATT_SOC_UNKNOWN;
-    batt_charging = BATT_CHG_UNKNOWN;
-    ESP_LOGW(TAG, "Battery divider not found on any ADC1 channel — battery unsupported");
+    batt_ch        = -1;
+    batt_gpio      = 0;
+    batt_mv        = 0;
+    batt_soc       = BATT_SOC_UNKNOWN;
+    batt_charging  = BATT_CHG_UNKNOWN;
+    batt_chg_ring_n = 0;
+}
+
+/* Accept candidate `idx` as the divider pin. */
+static void batt_accept(int idx) {
+    batt_ch   = (int8_t)BATT_PROBE_CH[idx];
+    batt_gpio = BATT_PROBE_GPIO[idx];
+    batt_supported = true;
+    prefs_set_u8(KEY_BATT_CH, (uint8_t)batt_ch);
+    ESP_LOGI(TAG, "Battery divider on GPIO%u (ADC1_CH%d): pin %u mV -> VBAT %u mV%s",
+             batt_gpio, (int)batt_ch, batt_probe_result_mv[idx],
+             batt_probe_result_mv[idx] * BATT_DIVIDER_NUM,
+             (BATT_PROBE_CH[idx] == BATT_PRIMARY_CH) ? " (V1.2 spec pin)" : " (ALTERNATE)");
+}
+
+/* Full probe pass: spec pin first, then the documented alternates. Returns
+ * true if a divider channel was found. Every candidate is measured even
+ * after a hit so the 0xC7 0x01 diagnostic dump shows the whole picture. */
+static bool batt_probe(void) {
+    int hit = -1;
+    for (int i = 0; i < BATT_PROBE_CANDIDATES; i++) {
+        if (batt_probe_channel(i) && hit < 0) hit = i;
+    }
+    if (hit >= 0) {
+        batt_accept(hit);
+        return true;
+    }
+    batt_mark_unsupported();
+    ESP_LOGW(TAG, "No VBAT divider found (GPIO36/39/34/32/33) — expected on V1.1 "
+                  "boards, which have no divider fitted. Battery reports unsupported.");
     return false;
 }
 
@@ -4392,7 +4451,7 @@ static void batt_ble_log_state(void) {
                 (unsigned)batt_mv, (unsigned)batt_soc, (unsigned)batt_charging,
                 (unsigned)batt_gpio);
     } else {
-        ble_log("batt: unsupported (no divider found / non-U4WDH board)");
+        ble_log("batt: unsupported (no VBAT divider — expected on V1.1)");
     }
 }
 
@@ -4405,43 +4464,62 @@ static void batt_task(void *arg) {
     /* Let boot + BLE bring-up settle before hogging the ADC lock. */
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    uint32_t pkg = esp_efuse_get_pkg_ver();
-    batt_pkg_ok = (pkg == EFUSE_RD_CHIP_VER_PKG_ESP32U4WDH);
-    if (!batt_pkg_ok) {
-        ESP_LOGW(TAG, "Battery: chip pkg %lu is not U4WDH — old dev board, monitor disabled",
-                 (unsigned long)pkg);
-        batt_supported = false;
-    } else {
-        esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12,
-                                 1100, &batt_adc_chars);
-        if (batt_probe()) {
-            /* Seed the smoothed value so the first emit is real. */
-            batt_mv  = batt_read_pin_mv((adc1_channel_t)batt_ch, NULL) * BATT_DIVIDER_NUM;
-            batt_soc = batt_soc_of_mv(batt_mv);
-            batt_charging = 0;
+    /* Package is logged for diagnostics only. It is NOT a gate: the pin is
+     * specified (GPIO36) and GPIO35 is excluded from the candidate list, so
+     * an old dev board simply fails the band/stability gates and reports
+     * unsupported. Gating on the package would only risk a false negative on
+     * a production unit whose efuse reads something unexpected. */
+    ESP_LOGI(TAG, "Battery: chip pkg %lu (U4WDH=%d)",
+             (unsigned long)esp_efuse_get_pkg_ver(), EFUSE_RD_CHIP_VER_PKG_ESP32U4WDH);
+
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12,
+                             1100, &batt_adc_chars);
+
+    /* Fast path: a previous boot already confirmed the channel. Re-verify it
+     * (cheap) rather than trusting NVS blindly — a cached pin from a
+     * different board or a stale entry must not produce fake readings. */
+    uint8_t cached = prefs_get_u8(KEY_BATT_CH, 0xFF);
+    bool located = false;
+    if (cached != 0xFF) {
+        for (int i = 0; i < BATT_PROBE_CANDIDATES; i++) {
+            if ((uint8_t)BATT_PROBE_CH[i] == cached) {
+                if (batt_probe_channel(i)) {
+                    batt_accept(i);
+                    located = true;
+                }
+                break;
+            }
         }
+        if (!located) {
+            ESP_LOGW(TAG, "Battery: cached channel %u no longer valid — full reprobe", cached);
+        }
+    }
+    if (!located) located = batt_probe();
+
+    if (located) {
+        /* Seed the smoothed value so the first emit is real. */
+        batt_mv  = batt_read_pin_mv((adc1_channel_t)batt_ch, NULL) * BATT_DIVIDER_NUM;
+        batt_soc = batt_soc_of_mv(batt_mv);
+        batt_charging = 0;
     }
 
     uint32_t last_emit_ms = 0;
     while (1) {
         if (batt_reprobe_req) {
-            /* Deferred 0xC7 0x01 diagnostic: re-run the probe and dump every
-             * candidate's reading to the dashboard log. */
+            /* Deferred 0xC7 0x01 diagnostic: drop the cached pin, re-run the
+             * full probe, and dump every candidate's reading (pin-side mV) so
+             * a bench tester can see exactly what each ADC input is doing. */
             batt_reprobe_req = false;
-            if (batt_pkg_ok) {
-                batt_probe();
-                ble_log("probe g34=%u g35=%u g32=%u g33=%u",
-                        batt_probe_result_mv[0], batt_probe_result_mv[1],
-                        batt_probe_result_mv[2], batt_probe_result_mv[3]);
-                ble_log("probe g36=%u g39=%u g37=%u g38=%u",
-                        batt_probe_result_mv[4], batt_probe_result_mv[5],
-                        batt_probe_result_mv[6], batt_probe_result_mv[7]);
-                if (batt_supported) {
-                    batt_mv  = batt_read_pin_mv((adc1_channel_t)batt_ch, NULL) * BATT_DIVIDER_NUM;
-                    batt_soc = batt_soc_of_mv(batt_mv);
-                }
-            } else {
-                ble_log("probe skipped: non-U4WDH board");
+            prefs_set_u8(KEY_BATT_CH, 0xFF);
+            batt_probe();
+            ble_log("probe g36=%u g39=%u g34=%u",
+                    batt_probe_result_mv[0], batt_probe_result_mv[1],
+                    batt_probe_result_mv[2]);
+            ble_log("probe g32=%u g33=%u (pin mV, x2 = VBAT)",
+                    batt_probe_result_mv[3], batt_probe_result_mv[4]);
+            if (batt_supported) {
+                batt_mv  = batt_read_pin_mv((adc1_channel_t)batt_ch, NULL) * BATT_DIVIDER_NUM;
+                batt_soc = batt_soc_of_mv(batt_mv);
             }
             batt_emit_frame();
             batt_ble_log_state();
