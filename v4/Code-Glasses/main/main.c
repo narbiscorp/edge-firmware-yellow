@@ -109,6 +109,14 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  *
+ * CHANGELOG v4.18.4 (yellow: coast when clear) — YELLOW LENS BUILD:
+ * - Drive the bridge in COAST (both DRV8837 inputs low → outputs Hi-Z, cell
+ *   floats & self-bleeds) whenever the lens is fully clear (command 0), instead
+ *   of brake (both high = low-side FETs on + input-pulldown current). Lowers the
+ *   bridge's draw during awake idle-clear (session inactive, OTA, bottom of a
+ *   breath). Tint states unchanged (still drive/brake). Still can't touch the
+ *   LM2665/DRV8837 quiescent — that floor needs the board mod.
+ *
  * CHANGELOG v4.18.3 (yellow: sleep pin latch) — YELLOW LENS BUILD:
  * - Latch the lens pins LOW through deep sleep (gpio_hold + deep_sleep_hold).
  *   Unheld, they drift to Hi-Z once asleep and the DRV8837 inputs can sit at an
@@ -1734,7 +1742,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.18.3-yellow-battery"
+#define FIRMWARE_VERSION "4.18.4-yellow-battery"
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
  * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
@@ -3209,13 +3217,24 @@ static bool IRAM_ATTR drive_timer_cb(gptimer_handle_t timer,
      * discharge→recharge each period (hundreds of µA of wasteful switching
      * while tinting). At 1024 the pin is a clean constant LOW → pure DC drive
      * with only the intended 100Hz AC alternation. */
-    uint32_t raw = is_on ? PWM_FULL_RAW : 0;
-    if (ac_phase == 0) {
-        pwm1_set_isr(PWM_FULL_RAW);
-        pwm2_set_isr(PWM_FULL_RAW - raw);
+    if (tint == 0) {
+        /* v4.18.4 power: fully-clear → COAST, not brake. Both DRV8837 inputs
+         * low → outputs Hi-Z, the cell floats and self-bleeds clear. That draws
+         * less than brake (both inputs high = active low-side FETs + input-
+         * pulldown current) whenever the lens is idle-clear while awake (session
+         * inactive, OTA, the bottom of a breath). Tint states are unaffected —
+         * they still drive/brake below. */
+        pwm1_set_isr(0);
+        pwm2_set_isr(0);
     } else {
-        pwm1_set_isr(PWM_FULL_RAW - raw);
-        pwm2_set_isr(PWM_FULL_RAW);
+        uint32_t raw = is_on ? PWM_FULL_RAW : 0;
+        if (ac_phase == 0) {
+            pwm1_set_isr(PWM_FULL_RAW);
+            pwm2_set_isr(PWM_FULL_RAW - raw);
+        } else {
+            pwm1_set_isr(PWM_FULL_RAW - raw);
+            pwm2_set_isr(PWM_FULL_RAW);
+        }
     }
 #else
     /* ── AC alternation ── */
