@@ -109,6 +109,18 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  *
+ * CHANGELOG v4.18.2 (yellow: drive power fix) — YELLOW LENS BUILD:
+ * - Removed a wasteful 10kHz switching artifact in the bridge drive. The "on"
+ *   state used PWM_MAX_RAW (1023), leaving the driven-low pin at duty 1/1024 —
+ *   a 0.1% pulse per 10kHz LEDC period that briefly braked (shorted) the cell
+ *   and forced a full discharge→recharge every 100µs. That burned hundreds of
+ *   µA of switching current whenever the lens was tinting (worst at the max=100
+ *   curve). Now uses PWM_FULL_RAW (true 100%) → clean DC ±6.6V with only the
+ *   intended 100Hz AC. Tint/curve behavior unchanged; lower active current + EMI.
+ *   NOTE: the ~1mA idle floor is the LM2665 + DRV8837 quiescent (SD→GND,
+ *   nSLEEP→3V3 hardwired on the v4 board) — firmware can't gate those without a
+ *   hardware mod (route nSLEEP/SD to a spare GPIO, then sleep the bridge idle).
+ *
  * CHANGELOG v4.18.1 (yellow: silent program 1) — YELLOW LENS BUILD:
  * - Ported gray v4.16.1's program-1 indicator silence. Program 1 (BREATHE, where
  *   every power-on lands) no longer fires the 1-pulse "which program" indicator —
@@ -1714,7 +1726,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.18.1-yellow-battery"
+#define FIRMWARE_VERSION "4.18.2-yellow-battery"
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
  * H-bridge between GPIO27/26 and the cell). 1 = bridge hardware (yellow),
@@ -3182,8 +3194,14 @@ static bool IRAM_ATTR drive_timer_cb(gptimer_handle_t timer,
         ac_phase = !ac_phase;
     }
 
-    /* ── Apply: full drive (±6.6V, AC) when on, brake (0V) when off ── */
-    uint32_t raw = is_on ? PWM_MAX_RAW : 0;
+    /* ── Apply: full drive (±6.6V, AC) when on, brake (0V) when off ──
+     * v4.18.2 power fix: use PWM_FULL_RAW (true 100%, =2^res) — NOT PWM_MAX_RAW
+     * (1023). With 1023 the "driven-low" pin sat at duty 1/1024, a 0.1% 10kHz
+     * pulse that briefly shorted the cell every 100µs and forced a full
+     * discharge→recharge each period (hundreds of µA of wasteful switching
+     * while tinting). At 1024 the pin is a clean constant LOW → pure DC drive
+     * with only the intended 100Hz AC alternation. */
+    uint32_t raw = is_on ? PWM_FULL_RAW : 0;
     if (ac_phase == 0) {
         pwm1_set_isr(PWM_FULL_RAW);
         pwm2_set_isr(PWM_FULL_RAW - raw);
