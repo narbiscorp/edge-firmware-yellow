@@ -134,6 +134,61 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  *
+ * CHANGELOG v4.20.0 (yellow: bridge power gate + sleep-path correctness):
+ *
+ * SLEEP CURRENT -- THE RECORD, CORRECTED. Everything v4.19.1 and the original
+ * v4.19.2 said about sleep current was wrong, because the measurements behind
+ * them were wrong. The meter was not inline with the battery. Measured properly
+ * (battery connected, meter in series with the pack) EVERY unit draws about
+ * 1 mA asleep, on every firmware version, in every lens mode. The 35 uA / 45 uA
+ * "good units" never existed, and neither did the 800-uA-vs-1-mA split.
+ *
+ * Disproven on the bench, do not re-litigate: the deep-sleep pad hold on
+ * GPIO27/26 (v4.18.3, restored by v4.19.1) is NOT worth 200 uA; a charged cell
+ * backfeeding the 6.6 V rail is not it; an unreleased RTC pad latch is not it;
+ * BLE advertising is not it; LED mode (STATIC vs BREATHE) is not it. None of
+ * them move sleep current at all.
+ *
+ * ~1 mA IS THE LM2665 + DRV8837 QUIESCENT and no firmware can reach it on the
+ * boards built so far. The flex carries only 3V3, GND, HALL, lens1, lens2 --
+ * there is no conductor that disables the bridge. LM2665 SD is tied to GND
+ * (normal operation) and DRV8837 nSLEEP to 3V3 (always awake). Everything else
+ * is already minimal: GPIO27/26 are the board's only outputs, the RTC slow
+ * clock is the internal RC, there is no ULP and no RTC_DATA_ATTR to retain, and
+ * ESP32 deep sleep itself is ~10-20 uA.
+ *
+ * WHAT THIS BUILD ADDS
+ * - LENS_BRIDGE_EN_GPIO (default -1 = off): the firmware half of the hardware
+ *   fix. Point it at a GPIO driving a load switch on the bridge's 3V3 feed and
+ *   enter_deep_sleep() cuts the rail after parking the lens, app_main() restores
+ *   it on wake. Inert on every existing unit -- with -1 it compiles to nothing.
+ *   See the define for the D1 caveat (gate the 3V3 feed, not SD alone) and the
+ *   board-side pull-down requirement.
+ * - FIX: led_task clobbered the sleep-entry lens clear. enter_deep_sleep() set
+ *   effective_duty = 0, but led_task rewrites effective_duty from the breath
+ *   waveform on its 10 ms tick, so in BREATHE the zero was gone within one tick
+ *   and the lens was still being driven when the drive timer stopped. A
+ *   lens_shutdown flag now parks led_task first. Real defect, found while
+ *   chasing the phantom above; unrelated to current draw.
+ * - The cell is drained (brake for LENS_SLEEP_DRAIN_MS) before sleep. Kept from
+ *   the original v4.19.2 but for the correct reason: the GH cell is BISTABLE,
+ *   so a cell left charged STAYS TINTED while the glasses are asleep. This
+ *   parks them clear. It is not a power fix and does not measurably change
+ *   sleep current.
+ * - The v4.18.3/v4.19.1 deep-sleep pad hold stays REMOVED. It buys nothing and
+ *   it is what bricked lenses in v4.18.3. The RELEASES in app_main() and
+ *   pwm_init() stay -- those are what recover a still-latched unit.
+ * - Restores the "-battery" token in FIRMWARE_VERSION, dropped by accident in
+ *   v4.19.0 (4.18.5-yellow-battery -> 4.19.0-yellow). Clients gating battery UI
+ *   on that suffix rather than the numeric version would have seen yellow stop
+ *   reporting battery at 4.19.0. Still contains "yellow", so OTA routing on DIS
+ *   0x2A26 is unaffected.
+ *
+ * PROCESS NOTE: v4.19.1 shipped to the live OTA channel on a 200 uA delta
+ * between two single-unit measurements that were both wrong. Do not ship a
+ * power change without a controlled A/B -- same unit, same binary, one variable
+ * -- and confirm the measurement setup before trusting any of it.
+ *
  * CHANGELOG v4.19.1 (yellow: sleep current) -- YELLOW LENS BUILD:
  * - Restores v4.18.3's deep-sleep pad hold on the lens pins, which v4.18.5 had
  *   removed as "redundant". It is not: bench-measured ~800 uA asleep with the
@@ -1985,9 +2040,9 @@
  *   all unchanged. */
 
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.19.1-yellow-FCC-TEST"
+#define FIRMWARE_VERSION "4.20.0-yellow-battery-FCC-TEST"
 #else
-#define FIRMWARE_VERSION "4.19.1-yellow"
+#define FIRMWARE_VERSION "4.20.0-yellow-battery"
 #endif
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
@@ -2231,6 +2286,34 @@ static const char *TAG = "SG_v4.14.39";
 #define PWM_FULL_RAW            1024   /* duty = 2^res: LEDC constant-high (no
                                         * 1/1024 glitch). Bridge reference pin
                                         * and brake state use this. */
+/* v4.19.2: how long to hold the bridge in brake before deep sleep, to drain the
+ * cell. The GH cell is ~100 nF through the DRV8837's ~1 ohm low-side FETs, so
+ * this is orders of magnitude longer than needed -- it is cheap (once, on the
+ * way to sleep) and covers a slow/leaky cell. */
+#define LENS_SLEEP_DRAIN_MS     50
+
+/* v4.20.0: OPTIONAL lens-bridge power gate.
+ *
+ * On every unit built to date this is -1 and every line below compiles to
+ * nothing -- the flex carries only 3V3, GND, HALL, lens1, lens2, so there is
+ * no conductor that can disable the bridge. LM2665 SD is tied to GND (normal
+ * operation, TI SNVS009H 8.4.1: shutdown needs SD above 40% of V+) and DRV8837
+ * nSLEEP is tied to 3V3 (always awake). Together they are the ~1 mA this build
+ * cannot reach; see the sleep-current note below.
+ *
+ * Set this to the GPIO driving a load switch on the bridge's 3V3 feed and the
+ * firmware will cut the rail before deep sleep and restore it on wake. Gate the
+ * 3V3 FEED, not SD alone: D1 (anode 3V3, cathode 6V6) is the LM2665 startup
+ * diode, so with SD shut down the 6V6 rail still sits at ~3V3 - Vf and the
+ * DRV8837's VM stays powered.
+ *
+ * BOARD REQUIREMENT: the enable net needs a resistor holding the switch OFF
+ * when the GPIO is not driven. The ESP32 floats its pads in deep sleep, and a
+ * floating enable would let the rail come back up and defeat the whole point.
+ * This is deliberately NOT solved with gpio_hold_en() -- that is what bricked
+ * the lens in v4.18.3, and a pull resistor is both cheaper and safer. */
+#define LENS_BRIDGE_EN_GPIO        -1   /* -1 = no gate fitted (all units today) */
+#define LENS_BRIDGE_EN_ACTIVE_HIGH  1   /* 1 = drive HIGH to enable the rail */
 
 /* Low-end visibility floor (v4.15.4; v4.16.0 gated on LENS_BRIDGE).
  * Electrochromic tint isn't visible below a ~1.7Vrms threshold. Duty 1..100
@@ -3280,6 +3363,13 @@ static void prefs_load(void) {
 
 /* AC drive state - shared between tasks */
 static volatile uint8_t effective_duty = 0;
+/* v4.20.0: set once by enter_deep_sleep() so led_task stops writing
+ * effective_duty while the lens is being parked. Without it the "clear the
+ * lens" write is immediately clobbered -- led_task runs a 10 ms tick and
+ * rewrites effective_duty from the breath waveform every tick, so in BREATHE
+ * the lens was still being driven when the drive timer stopped. Never cleared:
+ * the only exit from here is deep sleep, and a wake is a fresh boot. */
+static volatile bool lens_shutdown = false;
 
 /* v4.15.7: STATIC-mode glide state (lens config knobs A0/A1).
  * lens_apply_static() is the single entry point for commanded static duty
@@ -3537,6 +3627,25 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg);
 /*******************************************************************************
  * PWM FUNCTIONS
  ******************************************************************************/
+/* v4.20.0: enable/disable the bridge's 3V3 rail. Compiles to nothing unless
+ * LENS_BRIDGE_EN_GPIO is configured, so this is inert on every existing unit. */
+static void lens_bridge_power(bool on)
+{
+#if LENS_BRIDGE_EN_GPIO >= 0
+    const int en  = LENS_BRIDGE_EN_ACTIVE_HIGH ? 1 : 0;
+    gpio_set_direction((gpio_num_t)LENS_BRIDGE_EN_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)LENS_BRIDGE_EN_GPIO, on ? en : !en);
+    if (on) {
+        /* Let the LM2665 charge its reservoir before anything drives the cell.
+         * 4.7 uF through the switch and the pump's soft start; 5 ms is ample
+         * and only costs on boot/wake. */
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+#else
+    (void)on;
+#endif
+}
+
 static void pwm_init(void) {
     /* v4.19.1: belt-and-braces release of the deep-sleep pad hold set by
      * enter_deep_sleep(). app_main() already does this on every boot; repeating
@@ -4793,6 +4902,14 @@ static void led_task(void *param) {
         xTaskGetTickCount() + pdMS_TO_TICKS(BOOT_INDICATOR_DELAY_MS);
 
     while (1) {
+        /* v4.20.0: once enter_deep_sleep() has started parking the lens, stop
+         * touching effective_duty. Everything below writes it on some path, and
+         * racing the shutdown is what left the cell driven into sleep. */
+        if (lens_shutdown) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
         /* v4.15.5: publish the breathe tick so the 0xBA handler (BLE task)
          * can anchor the phase to the current cycle position. */
         g_led_tick = tick_count;
@@ -5224,43 +5341,39 @@ static void led_task(void *param) {
 static void enter_deep_sleep(void) {
     ESP_LOGI(TAG, "Entering deep sleep...");
 
-    /* Clear lens and stop unified timer */
+    /* 1. Stop led_task writing effective_duty. It runs a 10 ms tick and rewrites
+     *    effective_duty from the breath waveform EVERY tick, so the clear below
+     *    used to be clobbered within one tick and the lens was still being
+     *    driven when the timer stopped. Two ticks is plenty for it to observe
+     *    the flag and park. */
+    lens_shutdown = true;
+    vTaskDelay(pdMS_TO_TICKS(30));
+
+    /* 2. Clear the lens and stop the drive timer. */
     effective_duty = 0;
-    vTaskDelay(pdMS_TO_TICKS(10));  /* Let timer apply zero duty */
+    vTaskDelay(pdMS_TO_TICKS(10));
     gptimer_stop(drive_timer);
     gptimer_disable(drive_timer);
     pwm_both_off();
 
-    /* Configure wake on Hall sensor LOW (arm opened) */
-    esp_sleep_enable_ext0_wakeup(HALL_PIN, 0);
+    /* 3. Drain the cell: both DRV8837 inputs high = brake = low-side FETs on =
+     *    the cell shorted to 0 V. This is product behavior, not a power fix --
+     *    the GH cell is BISTABLE, so a cell left charged stays tinted while the
+     *    glasses are asleep. Parking it clear means they sleep clear. Needs the
+     *    bridge still powered, so it must happen before step 4. */
+    pwm1_set_raw(PWM_FULL_RAW);
+    pwm2_set_raw(PWM_FULL_RAW);
+    vTaskDelay(pdMS_TO_TICKS(LENS_SLEEP_DRAIN_MS));
+    pwm_both_off();                 /* release to coast, cell now at 0 V */
 
-    /* v4.19.1: re-latch the lens pins LOW through deep sleep.
-     *
-     * This is v4.18.3's hold, restored. It is worth ~200 uA: bench-measured
-     * 2026-08-24, ~800 uA asleep with the hold vs >1 mA without. Left unheld,
-     * GPIO27/26 revert to their reset state as the digital domain powers down
-     * and the DRV8837's IN1/IN2 float to an intermediate level -- partial
-     * conduction in its input stage, burning that 200 uA for the whole sleep.
-     * The "the DRV8837 pulldowns already coast the pins" reasoning that removed
-     * it in v4.18.5 is contradicted by the meter.
-     *
-     * WHY THIS IS SAFE NOW. v4.18.3 BRICKED the lens with exactly this call.
-     * GPIO27/26 are RTC pads, so the latch survived reboot AND reflash, and
-     * v4.18.3 never released it -- on wake the LEDC could no longer drive the
-     * pins (lenses dead, BLE fine) and only a power cycle cleared it. The bug
-     * was the missing release, not the hold. Two independent releases now run
-     * before the lens is ever driven: app_main() clears both pads first thing
-     * on EVERY boot (a deep-sleep wake is a boot), and pwm_init() clears them
-     * again immediately before configuring LEDC. A latch cannot outlive the
-     * sleep it was set for, and a unit still stuck from v4.18.3 recovers on
-     * the next flash or wake.
-     *
-     * KEEP THIS LAST. gpio_hold_en() takes effect immediately, not at sleep
-     * entry, so any code between here and esp_deep_sleep_start() would find
-     * the lens frozen. */
-    gpio_hold_en((gpio_num_t)PWM1_OUTPUT_IO);
-    gpio_hold_en((gpio_num_t)PWM2_OUTPUT_IO);
-    gpio_deep_sleep_hold_en();
+    /* 4. Cut the bridge rail, if this board has a gate fitted. Order matters:
+     *    the inputs are already low from pwm_both_off(), so when VCC drops the
+     *    ESP32 is not driving IN1/IN2 into an unpowered DRV8837 and forward-
+     *    biasing its input ESD diodes. No-op when LENS_BRIDGE_EN_GPIO is -1. */
+    lens_bridge_power(false);
+
+    /* 5. Wake on Hall LOW (arm opened). */
+    esp_sleep_enable_ext0_wakeup(HALL_PIN, 0);
 
     esp_deep_sleep_start();
 }
@@ -8736,6 +8849,10 @@ void app_main(void) {
     };
     gpio_config(&io_conf);
 #endif
+
+    /* v4.20.0: bring the bridge rail up before anything drives the cell.
+     * No-op unless LENS_BRIDGE_EN_GPIO is configured. */
+    lens_bridge_power(true);
 
     /* Initialize PWM */
     pwm_init();
