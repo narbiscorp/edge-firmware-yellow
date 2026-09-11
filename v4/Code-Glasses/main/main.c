@@ -134,6 +134,19 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  *
+ * CHANGELOG v4.20.1 (yellow: port of gray v4.16.4 -- the 2-minute panic):
+ * - FIX: panic ~30 s after the BLE idle teardown. After BLE_IDLE_TIMEOUT_MS
+ *   with no client the stack tears down correctly, then the device panicked,
+ *   rebooted and came straight back up advertising, so the idle radio saving
+ *   (~43 mA measured on gray) never materialised. batt_emit_frame() called
+ *   ble_gatts_chr_updated(batt_bas_handle) with no stack guard; the handle is
+ *   populated once at GATT registration and was never cleared, so batt_task's
+ *   next 30 s emit called into a GATT server nimble_port_deinit() had already
+ *   freed. Yellow inherited the bug with the v4.18.0 battery port. Fix: gate
+ *   the BAS push on ble_stack_up and clear batt_bas_handle in
+ *   ble_stack_teardown(). Same two lines as gray; confirmed on the gray bench
+ *   (reset=PANIC -> reset=SW, radio stays down). No change while connected.
+ *
  * CHANGELOG v4.20.0 (yellow: bridge power gate + sleep-path correctness):
  *
  * SLEEP CURRENT -- THE RECORD, CORRECTED. Everything v4.19.1 and the original
@@ -2040,9 +2053,9 @@
  *   all unchanged. */
 
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.20.0-yellow-battery-FCC-TEST"
+#define FIRMWARE_VERSION "4.20.1-yellow-battery-FCC-TEST"
 #else
-#define FIRMWARE_VERSION "4.20.0-yellow-battery"
+#define FIRMWARE_VERSION "4.20.1-yellow-battery"
 #endif
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
@@ -4563,8 +4576,9 @@ static bool batt_probe(void) {
 }
 
 /* Emit the 0xFB frame (and push the BAS characteristic). Safe to call from
- * any task; send_status_frame gates on connection + subscription itself and
- * ble_gatts_chr_updated no-ops without a subscribed client. */
+ * any task; send_status_frame gates on connection + subscription itself
+ * (nimble_notify() bails on g_conn_handle == 0xFFFF), and the BAS push below
+ * is gated on the host actually being up. */
 static void batt_emit_frame(void) {
     uint8_t payload[4];
     payload[0] = (uint8_t)(batt_mv & 0xFF);
@@ -4572,7 +4586,15 @@ static void batt_emit_frame(void) {
     payload[2] = batt_soc;
     payload[3] = batt_charging;
     send_status_frame(BATT_FRAME_TYPE, payload, sizeof(payload));
-    if (batt_bas_handle != 0 && batt_soc != BATT_SOC_UNKNOWN) {
+    /* v4.20.1 FIX (gray v4.16.4) — THE 2-MINUTE RESET. This call had no stack
+     * guard. batt_bas_handle is populated once when the GATT table is
+     * registered and was never cleared, so after the BLE idle timeout tore the
+     * stack down, batt_task's next emit (every 30 s) called into a GATT server
+     * whose structures nimble_port_deinit() had already freed -> panic ->
+     * reboot -> straight back to advertising. The radio DID tear down
+     * correctly; it crashed a few seconds later. ble_gatts_chr_updated()
+     * no-ops without a subscribed client, but only on a live host. */
+    if (ble_stack_up && batt_bas_handle != 0 && batt_soc != BATT_SOC_UNKNOWN) {
         ble_gatts_chr_updated(batt_bas_handle);
     }
 }
@@ -7427,6 +7449,10 @@ static esp_err_t ble_stack_teardown(void) {
     }
 
     ble_stack_up = false;
+    /* v4.20.1 (gray v4.16.4): the GATT table is gone with the host; drop the
+     * cached val_handle so nothing can hand a stale handle to the GATT server
+     * before a re-init repopulates it via ble_gatts_add_svcs(). */
+    batt_bas_handle = 0;
     is_connected = false;
     g_conn_handle = 0xFFFF;
     notifications_enabled = false;
