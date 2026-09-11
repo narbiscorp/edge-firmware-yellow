@@ -177,12 +177,16 @@
  *   it on wake. Inert on every existing unit -- with -1 it compiles to nothing.
  *   See the define for the D1 caveat (gate the 3V3 feed, not SD alone) and the
  *   board-side pull-down requirement.
- * - FIX: led_task clobbered the sleep-entry lens clear. enter_deep_sleep() set
- *   effective_duty = 0, but led_task rewrites effective_duty from the breath
- *   waveform on its 10 ms tick, so in BREATHE the zero was gone within one tick
- *   and the lens was still being driven when the drive timer stopped. A
- *   lens_shutdown flag now parks led_task first. Real defect, found while
- *   chasing the phantom above; unrelated to current draw.
+ * - led_task is parked (lens_shutdown flag) before enter_deep_sleep() clears the
+ *   lens. Originally described as a fix for led_task's 10 ms breath tick
+ *   overwriting the sleep-entry effective_duty = 0. Review of v4.20.1 showed
+ *   that was NOT a live defect: drive_timer_cb() forces effective_duty = 0 on
+ *   every 100 us tick while !session_active, and every sleep path clears
+ *   session_active before calling enter_deep_sleep(), so the cell was not
+ *   being driven at sleep entry on v4.19.1 either. The tint seen on sleeping
+ *   units was the BISTABLE cell holding residual charge after coast -- that is
+ *   what the brake drain below fixes. lens_shutdown stays as belt-and-braces
+ *   so a future sleep path that forgets session_active cannot regress it.
  * - The cell is drained (brake for LENS_SLEEP_DRAIN_MS) before sleep. Kept from
  *   the original v4.19.2 but for the correct reason: the GH cell is BISTABLE,
  *   so a cell left charged STAYS TINTED while the glasses are asleep. This
@@ -3651,8 +3655,11 @@ static void lens_bridge_power(bool on)
     if (on) {
         /* Let the LM2665 charge its reservoir before anything drives the cell.
          * 4.7 uF through the switch and the pump's soft start; 5 ms is ample
-         * and only costs on boot/wake. */
-        vTaskDelay(pdMS_TO_TICKS(5));
+         * and only costs on boot/wake. NB: the FreeRTOS tick is 10 ms here
+         * (CONFIG_FREERTOS_HZ default 100), so pdMS_TO_TICKS(5) rounds to 0
+         * and vTaskDelay(0) is a bare yield with no settle at all. Two ticks
+         * guarantees >= 10 ms. */
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 #else
     (void)on;
@@ -3660,10 +3667,13 @@ static void lens_bridge_power(bool on)
 }
 
 static void pwm_init(void) {
-    /* v4.19.1: belt-and-braces release of the deep-sleep pad hold set by
-     * enter_deep_sleep(). app_main() already does this on every boot; repeating
-     * it here means ANY path that (re)initializes the lens PWM also clears the
-     * latch, so the v4.18.3 brick cannot recur through some future call order. */
+    /* v4.19.1: belt-and-braces release of the deep-sleep pad hold that older
+     * builds (v4.18.3, v4.19.1) set in enter_deep_sleep(). Nothing sets it any
+     * more (removed in v4.20.0), but a unit whose last sleep was on one of those
+     * builds still wakes latched. app_main() already does this on every boot;
+     * repeating it here means ANY path that (re)initializes the lens PWM also
+     * clears the latch, so the v4.18.3 brick cannot recur through some future
+     * call order. */
     gpio_deep_sleep_hold_dis();
     gpio_hold_dis((gpio_num_t)PWM1_OUTPUT_IO);
     gpio_hold_dis((gpio_num_t)PWM2_OUTPUT_IO);
@@ -5363,11 +5373,11 @@ static void led_task(void *param) {
 static void enter_deep_sleep(void) {
     ESP_LOGI(TAG, "Entering deep sleep...");
 
-    /* 1. Stop led_task writing effective_duty. It runs a 10 ms tick and rewrites
-     *    effective_duty from the breath waveform EVERY tick, so the clear below
-     *    used to be clobbered within one tick and the lens was still being
-     *    driven when the timer stopped. Two ticks is plenty for it to observe
-     *    the flag and park. */
+    /* 1. Park led_task so it stops writing effective_duty (10 ms breath tick).
+     *    Belt-and-braces: drive_timer_cb() already forces effective_duty = 0
+     *    while !session_active, which every caller clears first, so the cell is
+     *    not being driven here. The flag guards against a future sleep path
+     *    that forgets session_active. Three ticks for it to observe and park. */
     lens_shutdown = true;
     vTaskDelay(pdMS_TO_TICKS(30));
 
