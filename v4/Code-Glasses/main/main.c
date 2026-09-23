@@ -2057,9 +2057,9 @@
  *   all unchanged. */
 
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.20.1-yellow-battery-FCC-TEST"
+#define FIRMWARE_VERSION "4.20.2-yellow-battery-FCC-TEST"
 #else
-#define FIRMWARE_VERSION "4.20.1-yellow-battery"
+#define FIRMWARE_VERSION "4.20.2-yellow-battery"
 #endif
 
 /* Build for the yellow-lens HV bridge board (LM2665 doubler + DRV8837
@@ -2229,7 +2229,7 @@ static const char *TAG = "SG_v4.14.39";
  * time Tf is slow, so at high freq the cell stays dark-biased and saturates
  * early); the cost is more visible flicker. Higher freq = smoother but the
  * spread compresses toward binary. */
-#define DITHER_DHZ_DEFAULT      1200  /* v4.17.5: 120Hz (bench-tuned) */
+#define DITHER_DHZ_DEFAULT      600   /* v4.20.2: 60Hz ("new curve") */
 #define DITHER_HZ_MIN           10
 #define DITHER_HZ_MAX           120
 /* v4.17.1: tint transfer curve. The responsive dither zone is narrow (~0..15%
@@ -2248,20 +2248,20 @@ static const char *TAG = "SG_v4.14.39";
  *                     >10 stretches the low end, <10 the high end). */
 #define DITHER_MIN_PCT_DEFAULT   0    /* v4.17.8: bench-tuned */
 #define DITHER_MAX_PCT_DEFAULT   100  /* v4.17.8: full-drive peak */
-#define DITHER_GAMMA_X10_DEFAULT 5    /* v4.17.8: LOW-segment gamma 0.5 */
+#define DITHER_GAMMA_X10_DEFAULT 3    /* v4.20.2: LOW-segment gamma 0.3 */
 /* v4.17.4: optional 2nd curve segment for independent top-end shaping. The
  * window [min..max] is split at DITHER_KNEE_CMD (command %); command 1..knee
  * uses the low gamma, knee..100 uses the HIGH gamma. Knee dither is pinned to
  * the linear window position at that command. knee>=100 (default) = one
  * segment (low gamma across the whole range) = unchanged v4.17.3 behavior. */
-#define DITHER_GHI_X10_DEFAULT   22   /* v4.17.8: high-segment gamma 2.2 */
-#define DITHER_KNEE_DEFAULT      45   /* v4.17.8: split at command 45% */
+#define DITHER_GHI_X10_DEFAULT   15   /* v4.20.2: high-segment gamma 1.5 */
+#define DITHER_KNEE_DEFAULT      40   /* v4.20.2: split at command 40% */
 /* v4.17.6: knee dither level %. 0 = auto (pin to the linear window position,
  * = v4.17.5 behavior). >0 sets the dither on-fraction AT the knee command
  * explicitly (clamped to [min..max]), so the top segment (knee..100) can span
  * a wide visible band even for a high knee — lets the top clear progressively
  * on the exhale instead of holding a saturated plateau. */
-#define DITHER_KNEE_PCT_DEFAULT  10   /* v4.17.8: knee level 10% */
+#define DITHER_KNEE_PCT_DEFAULT  16   /* v4.20.2: knee level 16% */
 #define DEFAULT_SESSION_MIN     30      /* 30 minute session (v4.14.17: was 10) */
 #define DEFAULT_BRIGHTNESS      100     /* 100% brightness */
 #define DEFAULT_STROBE_DHZ      100       /* 10Hz default strobe (deci-Hz) */
